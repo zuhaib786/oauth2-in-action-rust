@@ -43,12 +43,13 @@ const CLIENT: ClientInfo = ClientInfo {
     client_id: "oauth-client-1",
     client_secret: "oauth-client-secret-1",
     redirect_uris: &["http://localhost:9000/callback"],
-    scope: "foo bar read write delete fruit veggies meats",
+    scope: "foo bar read write delete fruit veggies meats movies foods music",
 };
 
 const PROTECTED_RESOURCE: &str = "http://localhost:9002/resource";
 const WORDS_API: &str = "http://localhost:9002/words";
 const PRODUCE_API: &str = "http://localhost:9002/produce";
+const FAVORITES_API: &str = "http://localhost:9002/favorites";
 
 /// The JS keeps these in global variables (`var state = null;` etc.).
 /// Here they live in one struct behind a lock that every handler can reach
@@ -327,6 +328,26 @@ async fn produce(State(app): State<AppState>) -> Response {
     render("produce", context! { scope => s.scope, data => data })
 }
 
+// ---------------------------------------------------------------------------
+// Favorites API (chapter 4)
+// ---------------------------------------------------------------------------
+
+async fn favorites(State(app): State<AppState>) -> Response {
+    let s = app.lock().await;
+    let res = reqwest::Client::new()
+        .get(FAVORITES_API)
+        .header("Authorization", bearer(&s))
+        .send()
+        .await;
+
+    let data: Value = match res {
+        Ok(res) if res.status().is_success() => res.json().await.unwrap_or_default(),
+        _ => json!({ "user": "", "favorites": { "movies": [], "foods": [], "music": [] } }),
+    };
+    println!("Got data: {data}");
+    render("favorites", context! { scope => s.scope, data => data })
+}
+
 #[tokio::main]
 async fn main() {
     oauth_common::set_views_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/templates"));
@@ -341,6 +362,7 @@ async fn main() {
         .route("/add_word", get(add_word))
         .route("/delete_word", get(delete_word))
         .route("/produce", get(produce))
+        .route("/favorites", get(favorites))
         .with_state(AppState::default());
 
     oauth_common::serve(app, 9000, "OAuth Client").await;

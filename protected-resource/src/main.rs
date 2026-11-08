@@ -3,7 +3,16 @@
 //! APIs that only answer requests carrying a valid access token issued by
 //! the authorization server.
 //!
+//! EXERCISE 4-4 (book chapter 4): the Favorites API doesn't know whose
+//! favorites to send. Make `favorites` send Alice's or Bob's, depending on
+//! which user approved the token.
+//! Compare with the solution:  git diff ch4-ex4-done -- protected-resource
+//!
 //! Run it with:  cargo run -p protected-resource
+
+// Silences "unused variable/import" warnings until you've written your code.
+// Delete this line when you're done, to see if anything is left unused.
+#![allow(unused)]
 
 use std::{
     collections::HashMap,
@@ -175,6 +184,33 @@ async fn produce(token: AccessToken) -> Response {
     Json(produce).into_response()
 }
 
+async fn favorites(token: AccessToken) -> Response {
+    let alice_favorites = json!({
+        "movies": ["The Multidmensional Vector", "Space Fights", "Jewelry Boss"],
+        "foods": ["bacon", "pizza", "bacon pizza"],
+        "music": ["techno", "industrial", "alternative"],
+    });
+    let bob_favorites = json!({
+        "movies": ["An Unrequited Love", "Several Shades of Turquoise", "Think Of The Children"],
+        "foods": ["bacon", "kale", "gravel"],
+        "music": ["baroque", "ukulele", "baroque ukulele"],
+    });
+
+    /*
+     * TODO: Get different user information based on the information of who
+     * approved the token.
+     *
+     * Hints:
+     *   - the authorization server stores the approving user's name in the
+     *     token record: token.record["user"] is "alice" or "bob"
+     *   - send json!({ "user": "Alice", "favorites": alice_favorites }) for
+     *     Alice, the same with "Bob" for Bob
+     */
+
+    let unknown = json!({ "user": "Unknown", "favorites": { "movies": [], "foods": [], "music": [] } });
+    Json(unknown).into_response()
+}
+
 #[tokio::main]
 async fn main() {
     oauth_common::set_views_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/templates"));
@@ -186,6 +222,7 @@ async fn main() {
         .route("/resource", post(resource))
         .route("/words", get(get_words).post(add_word).delete(delete_word))
         .route("/produce", get(produce))
+        .route("/favorites", get(favorites))
         .layer(CorsLayer::permissive()) // `app.use(cors())`
         .with_state(state);
 

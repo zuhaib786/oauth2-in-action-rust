@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block content %}
+      <div class="jumbotron">
+        <h2>Favorites API</h2>
+        <p>Resource owner's name: {{ data.user }}</p>
+        <p>Movies:</p>
+        <ul>{% for v in data.favorites.movies %}<li>{{ v }}</li>{% endfor %}</ul>
+        <p>Foods:</p>
+        <ul>{% for v in data.favorites.foods %}<li>{{ v }}</li>{% endfor %}</ul>
+        <p>Music:</p>
+        <ul>{% for v in data.favorites.music %}<li>{{ v }}</li>{% endfor %}</ul>
+        <a href="/favorites" class="btn btn-default">Get Favorites</a>
+      </div>
+      <p><a href="/">&larr; Back to the client home page</a></p>
+{% endblock %}
