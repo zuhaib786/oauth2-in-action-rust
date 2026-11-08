@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block content %}
+      <div class="jumbotron">
+        <h2>Approve this client?</h2>
+        {% if client.client_name %}<p><b>Name:</b> <code>{{ client.client_name }}</code></p>{% endif %}
+        <p><b>ID:</b> <code>{{ client.client_id }}</code></p>
+        {% if client.client_uri %}<p><b>URI:</b> <code>{{ client.client_uri }}</code></p>{% endif %}
+        {% if client.logo_uri %}<p><b>logo:</b> <img src="{{ client.logo_uri }}" /></p>{% endif %}
+
+        <form class="form" action="/approve" method="POST">
+          <input type="hidden" name="reqid" value="{{ reqid }}">
+          {% if scope %}
+          <p>The client is requesting access to the following:</p>
+          <ul>
+            {% for s in scope %}
+            <li><input type="checkbox" name="scope_{{ s }}" id="scope_{{ s }}" checked="checked"> <label for="scope_{{ s }}">{{ s }}</label></li>
+            {% endfor %}
+          </ul>
+          {% endif %}
+          <input type="submit" class="btn btn-success" name="approve" value="Approve">
+          <input type="submit" class="btn btn-danger" name="deny" value="Deny">
+        </form>
+      </div>
+{% endblock %}

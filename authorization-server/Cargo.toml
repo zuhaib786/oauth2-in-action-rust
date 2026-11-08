@@ -1,0 +1,13 @@
+[package]
+name = "authorization-server"
+version = "0.1.0"
+edition = "2024"
+description = "The OAuth authorization server (port 9001)"
+
+[dependencies]
+oauth-common.workspace = true
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
