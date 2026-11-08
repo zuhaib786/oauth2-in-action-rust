@@ -141,12 +141,15 @@ fn has_extra_scope(requested: &[String], allowed: &[String]) -> bool {
 }
 
 /// Each ticked scope checkbox on the approval page arrives as a form field
-/// named "scope_<name>". Returns the <name> parts.
+/// named "scope_<name>". Returns the <name> parts, sorted.
 fn scopes_from_form(form: &HashMap<String, String>) -> Vec<String> {
-    form.keys()
+    let mut scopes: Vec<String> = form
+        .keys()
         .filter_map(|key| key.strip_prefix("scope_"))
         .map(String::from)
-        .collect()
+        .collect();
+    scopes.sort(); // a HashMap's keys come out in random order
+    scopes
 }
 
 /// Sends the browser back to the client's redirect URI with `?error=...`.

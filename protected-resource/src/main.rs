@@ -3,16 +3,7 @@
 //! APIs that only answer requests carrying a valid access token issued by
 //! the authorization server.
 //!
-//! EXERCISE 4-4 (book chapter 4): the Favorites API doesn't know whose
-//! favorites to send. Make `favorites` send Alice's or Bob's, depending on
-//! which user approved the token.
-//! Compare with the solution:  git diff ch4-ex4-done -- protected-resource
-//!
 //! Run it with:  cargo run -p protected-resource
-
-// Silences "unused variable/import" warnings until you've written your code.
-// Delete this line when you're done, to see if anything is left unused.
-#![allow(unused)]
 
 use std::{
     collections::HashMap,
@@ -196,19 +187,13 @@ async fn favorites(token: AccessToken) -> Response {
         "music": ["baroque", "ukulele", "baroque ukulele"],
     });
 
-    /*
-     * TODO: Get different user information based on the information of who
-     * approved the token.
-     *
-     * Hints:
-     *   - the authorization server stores the approving user's name in the
-     *     token record: token.record["user"] is "alice" or "bob"
-     *   - send json!({ "user": "Alice", "favorites": alice_favorites }) for
-     *     Alice, the same with "Bob" for Bob
-     */
-
-    let unknown = json!({ "user": "Unknown", "favorites": { "movies": [], "foods": [], "music": [] } });
-    Json(unknown).into_response()
+    // The authorization server recorded who approved this token.
+    let response = match token.record["user"].as_str() {
+        Some("alice") => json!({ "user": "Alice", "favorites": alice_favorites }),
+        Some("bob") => json!({ "user": "Bob", "favorites": bob_favorites }),
+        _ => json!({ "user": "Unknown", "favorites": { "movies": [], "foods": [], "music": [] } }),
+    };
+    Json(response).into_response()
 }
 
 #[tokio::main]
