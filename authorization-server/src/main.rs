@@ -4,17 +4,9 @@
 //! given to you finished, so you can see how the client and protected resource
 //! use it. In chapter 5 you build its endpoints yourself.
 //!
-//!
-//! EXERCISE 5-1 (book chapter 5): build the authorization server's three
-//! endpoints, /authorize, /approve and /token, for the authorization code
-//! grant. Each has a TODO with steps. The helpers above them do the fiddly
-//! parts. Until 5-3 adds scopes, the client's Words/Produce/Favorites
-//! pages won't work, because tokens have no scopes.
-//! Compare with the solution:  git diff ch5-ex1-done -- authorization-server
-//!
 //! Run it with:  cargo run -p authorization-server
 
-// Some helpers aren't used until a later exercise. This silences the
+// The scope helpers aren't used until exercise 5-3. This silences the
 // "unused" warnings until then.
 #![allow(unused)]
 
@@ -196,22 +188,23 @@ async fn authorize(
     State(app): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    /*
-     * TODO: Process the request, validate the client, and send the user to
-     * the approval page.
-     *
-     * Steps:
-     *   1. Look up the client: get_client(param(&query, "client_id")).
-     *      Unknown → render("error", context! { error => "Unknown client" })
-     *   2. The "redirect_uri" must be one of client.redirect_uris. If not,
-     *      show an error page ("Invalid redirect URI"). Don't redirect to
-     *      it: it could be an attacker's site!
-     *   3. Remember the request for /approve: put `query.clone()` into
-     *      app.inner.lock().await.requests under a new id, random_string(8)
-     *   4. render("approve", context! { client => client, reqid => reqid, users => &*USERS })
-     */
+    let client_id = param(&query, "client_id");
+    let redirect_uri = param(&query, "redirect_uri");
 
-    render("error", context! { error => "TODO: implement /authorize in authorization-server/src/main.rs" })
+    let Some(client) = get_client(client_id) else {
+        println!("Unknown client {client_id}");
+        return render("error", context! { error => "Unknown client" });
+    };
+
+    if !client.redirect_uris.iter().any(|uri| uri == redirect_uri) {
+        println!("Mismatched redirect URI, expected {:?} got {redirect_uri}", client.redirect_uris);
+        return render("error", context! { error => "Invalid redirect URI" });
+    }
+
+    let reqid = random_string(8);
+    app.inner.lock().await.requests.insert(reqid.clone(), query.clone());
+
+    render("approve", context! { client => client, reqid => reqid, users => &*USERS })
 }
 
 /// The approval page's form posts here when the user clicks Approve or Deny.
@@ -219,26 +212,47 @@ async fn approve(
     State(app): State<AppState>,
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
-    /*
-     * TODO: Process the results of the approval page, authorize the client.
-     *
-     * Steps:
-     *   1. Take the saved request out of state.requests using the form's
-     *      "reqid" (`remove` gets it and deletes it in one go).
-     *      Not found → error page "No matching authorization request"
-     *   2. The user clicked Deny if the form has no "approve" field. Then:
-     *      redirect_with_error(redirect_uri, "access_denied")
-     *   3. If the request's response_type isn't "code":
-     *      redirect_with_error(redirect_uri, "unsupported_response_type")
-     *   4. Find the user they picked: get_user(param(&form, "user"))
-     *   5. Make a code, random_string(8), and save a CodeInfo for it in
-     *      state.codes (use `scope: Vec::new()` for now; scopes come in 5-3)
-     *   6. Redirect to redirect_uri with ?code=...&state=... using
-     *      build_url(...). Send back the client's `state` exactly as it
-     *      sent it, if it sent one.
-     */
+    let mut state = app.inner.lock().await;
 
-    render("error", context! { error => "TODO: implement /approve in authorization-server/src/main.rs" })
+    let Some(query) = state.requests.remove(param(&form, "reqid")) else {
+        // there was no matching saved request, this is an error
+        return render("error", context! { error => "No matching authorization request" });
+    };
+    let redirect_uri = param(&query, "redirect_uri");
+
+    if !form.contains_key("approve") {
+        // user denied access
+        return redirect_with_error(redirect_uri, "access_denied");
+    }
+
+    if param(&query, "response_type") != "code" {
+        // we got a response type we don't understand
+        return redirect_with_error(redirect_uri, "unsupported_response_type");
+    }
+
+    // user approved access
+    let username = param(&form, "user");
+    let Some(user) = get_user(username) else {
+        println!("Unknown user {username}");
+        return render("error", context! { error => format!("Unknown user {username}") });
+    };
+
+    let code = random_string(8);
+
+    // The client must get back exactly the `state` it sent us.
+    let mut params = vec![("code", code.as_str())];
+    if let Some(client_state) = query.get("state") {
+        params.push(("state", client_state));
+    }
+    let location = build_url(redirect_uri, &params);
+
+    // save the code and request for later
+    state.codes.insert(
+        code.clone(),
+        CodeInfo { request: query, scope: Vec::new(), user: user.preferred_username.clone() },
+    );
+
+    Redirect::to(&location).into_response()
 }
 
 /// The token endpoint. The client calls this directly (not through the
@@ -248,29 +262,86 @@ async fn token(
     headers: HeaderMap,
     Form(body): Form<HashMap<String, String>>,
 ) -> Response {
-    /*
-     * TODO: Process the request, issue an access token.
-     *
-     * Steps:
-     *   1. Authenticate the client. Its id and secret come either in the
-     *      Authorization header (decode_client_credentials(...) reads it)
-     *      or as client_id and client_secret in the form body, but not both.
-     *      Any problem → json_error(StatusCode::UNAUTHORIZED, "invalid_client")
-     *   2. grant_type must be "authorization_code". If not:
-     *      json_error(StatusCode::BAD_REQUEST, "unsupported_grant_type")
-     *   3. Take the code out of state.codes so it can't be used twice. It
-     *      must exist and belong to this client. If not:
-     *      json_error(StatusCode::BAD_REQUEST, "invalid_grant")
-     *   4. Make an access token, random_string(32), and save it so the
-     *      protected resource can find it:
-     *          app.db.insert(json!({ "access_token": ..., "client_id": ..., "scope": ..., "user": ... }))
-     *   5. Answer: Json(json!({ "access_token": ..., "token_type": "Bearer" })).into_response()
-     *
-     * Tip: a separate `async fn authorization_code_grant(...)` for steps 3-5
-     * keeps this tidy, and gives later grant types an obvious place to go.
-     */
+    // --- Who is calling? Authenticate the client. ---
+    let mut client_id = None;
+    let mut client_secret = None;
 
-    json_error(StatusCode::NOT_IMPLEMENTED, "TODO: implement /token")
+    // check the auth header
+    if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+        if let Some((id, secret)) = decode_client_credentials(auth) {
+            client_id = Some(id);
+            client_secret = Some(secret);
+        }
+    }
+
+    // otherwise, check the post body
+    if let Some(id) = body.get("client_id") {
+        if client_id.is_some() {
+            // if we've already seen the client's credentials in the authorization header, this is an error
+            println!("Client attempted to authenticate with multiple methods");
+            return json_error(StatusCode::UNAUTHORIZED, "invalid_client");
+        }
+        client_id = Some(id.clone());
+        client_secret = body.get("client_secret").cloned();
+    }
+
+    let client_id = client_id.unwrap_or_default();
+    let Some(client) = get_client(&client_id) else {
+        println!("Unknown client {client_id}");
+        return json_error(StatusCode::UNAUTHORIZED, "invalid_client");
+    };
+
+    if client_secret.as_deref() != Some(client.client_secret.as_str()) {
+        println!("Mismatched client secret, expected {} got {client_secret:?}", client.client_secret);
+        return json_error(StatusCode::UNAUTHORIZED, "invalid_client");
+    }
+
+    // --- Which grant type is the client using? ---
+    match param(&body, "grant_type") {
+        "authorization_code" => authorization_code_grant(&app, client, &body).await,
+        other => {
+            println!("Unknown grant type {other}");
+            json_error(StatusCode::BAD_REQUEST, "unsupported_grant_type")
+        }
+    }
+}
+
+/// grant_type=authorization_code: trade a code from /approve for a token.
+async fn authorization_code_grant(
+    app: &AppState,
+    client: &Client,
+    body: &HashMap<String, String>,
+) -> Response {
+    let code_value = param(body, "code");
+
+    // `remove` both looks the code up and burns it, so it can only be used once
+    let Some(code) = app.inner.lock().await.codes.remove(code_value) else {
+        println!("Unknown code, {code_value}");
+        return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
+    };
+
+    let code_client_id = param(&code.request, "client_id");
+    if code_client_id != client.client_id {
+        println!("Client mismatch, expected {code_client_id} got {}", client.client_id);
+        return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
+    }
+
+    let access_token = random_string(32);
+    app.db.insert(json!({
+        "access_token": access_token,
+        "client_id": client.client_id,
+        "scope": code.scope,
+        "user": code.user,
+    }));
+
+    println!("Issuing access token {access_token}");
+    println!("Issued tokens for code {code_value}");
+
+    Json(json!({
+        "access_token": access_token,
+        "token_type": "Bearer",
+    }))
+    .into_response()
 }
 
 #[tokio::main]
