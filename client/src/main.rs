@@ -15,7 +15,7 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
     routing::get,
 };
-use oauth_common::{build_url, context, encode_client_credentials, random_string, render};
+use oauth_common::{build_url, context, encode_client_credentials, param, random_string, render};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
@@ -43,10 +43,11 @@ const CLIENT: ClientInfo = ClientInfo {
     client_id: "oauth-client-1",
     client_secret: "oauth-client-secret-1",
     redirect_uris: &["http://localhost:9000/callback"],
-    scope: "foo",
+    scope: "foo bar read write delete",
 };
 
 const PROTECTED_RESOURCE: &str = "http://localhost:9002/resource";
+const WORDS_API: &str = "http://localhost:9002/words";
 
 /// The JS keeps these in global variables (`var state = null;` etc.).
 /// Here they live in one struct behind a lock that every handler can reach
@@ -241,6 +242,71 @@ async fn refresh_access_token(s: &mut ClientState) -> Response {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Words API (chapter 4)
+// ---------------------------------------------------------------------------
+
+/// The `Authorization` header value for calling the protected resource.
+fn bearer(s: &ClientState) -> String {
+    format!("Bearer {}", s.access_token.as_deref().unwrap_or(""))
+}
+
+/// Shows the Words page. `result` says which button was pressed and whether
+/// it worked ("get", "noget", "add", "noadd", "rm", "norm"), or is "".
+fn words_page(words: &str, timestamp: u64, result: &str) -> Response {
+    render("words", context! { words => words, timestamp => timestamp, result => result })
+}
+
+async fn words() -> Response {
+    words_page("", 0, "")
+}
+
+async fn get_words(State(app): State<AppState>) -> Response {
+    let s = app.lock().await;
+    let res = reqwest::Client::new()
+        .get(WORDS_API)
+        .header("Authorization", bearer(&s))
+        .send()
+        .await;
+
+    match res {
+        Ok(res) if res.status().is_success() => {
+            let body: Value = res.json().await.unwrap_or_default();
+            let words = body["words"].as_str().unwrap_or("");
+            words_page(words, body["timestamp"].as_u64().unwrap_or(0), "get")
+        }
+        _ => words_page("", 0, "noget"),
+    }
+}
+
+async fn add_word(
+    State(app): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let s = app.lock().await;
+    let res = reqwest::Client::new()
+        .post(WORDS_API)
+        .header("Authorization", bearer(&s))
+        .form(&[("word", param(&params, "word"))])
+        .send()
+        .await;
+
+    let worked = matches!(&res, Ok(r) if r.status().is_success());
+    words_page("", 0, if worked { "add" } else { "noadd" })
+}
+
+async fn delete_word(State(app): State<AppState>) -> Response {
+    let s = app.lock().await;
+    let res = reqwest::Client::new()
+        .delete(WORDS_API)
+        .header("Authorization", bearer(&s))
+        .send()
+        .await;
+
+    let worked = matches!(&res, Ok(r) if r.status().is_success());
+    words_page("", 0, if worked { "rm" } else { "norm" })
+}
+
 #[tokio::main]
 async fn main() {
     oauth_common::set_views_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/templates"));
@@ -250,6 +316,10 @@ async fn main() {
         .route("/authorize", get(authorize))
         .route("/callback", get(callback))
         .route("/fetch_resource", get(fetch_resource))
+        .route("/words", get(words))
+        .route("/get_words", get(get_words))
+        .route("/add_word", get(add_word))
+        .route("/delete_word", get(delete_word))
         .with_state(AppState::default());
 
     oauth_common::serve(app, 9000, "OAuth Client").await;
