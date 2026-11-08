@@ -1,17 +1,11 @@
 //! The OAuth client (http://localhost:9000).
 //!
-//! EXERCISE 3-2 (book chapter 3): the client starts with an access token that
-//! doesn't work and a refresh token that does. Make it refresh:
-//!   1. in `fetch_resource`, when the protected resource says no, call
-//!      `refresh_access_token` instead of showing an error
-//!   2. fill in `refresh_access_token`
-//! Compare with the solution:  git diff ch3-ex2-done -- client
+//! It gets an access token from the authorization server using the
+//! authorization code grant, then uses it to call the protected resource.
+//! When the access token stops working, it gets a new one with the
+//! refresh token.
 //!
 //! Run it with:  cargo run -p client
-
-// Silences "unused variable/import" warnings until you've written your code.
-// Delete this line when you're done, to see if anything is left unused.
-#![allow(unused)]
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -203,18 +197,14 @@ async fn fetch_resource(State(app): State<AppState>) -> Response {
             render("data", context! { resource => body })
         }
         Ok(res) => {
-            /*
-             * TODO: Instead of always returning an error like we do here,
-             * refresh the access token if we have a refresh token.
-             *
-             * Hint: `refresh_access_token(&mut s).await` hands our state to
-             * the function below.
-             */
-            println!("resource status error code {}", res.status());
-            render(
-                "error",
-                context! { error => format!("Unable to fetch resource. Status {}", res.status().as_u16()) },
-            )
+            // The access token didn't work (maybe it expired). Try to get a
+            // new one with the refresh token, if we have one.
+            s.access_token = None;
+            if s.refresh_token.is_some() {
+                refresh_access_token(&mut s).await
+            } else {
+                render("error", context! { error => res.status().as_u16() })
+            }
         }
         Err(err) => render("error", context! { error => format!("Resource request failed: {err}") }),
     }
@@ -223,20 +213,44 @@ async fn fetch_resource(State(app): State<AppState>) -> Response {
 /// Trades our refresh token for a new access token, then sends the browser
 /// back to /fetch_resource to try again.
 async fn refresh_access_token(s: &mut ClientState) -> Response {
-    /*
-     * TODO: Use the refresh token to get a new access token
-     *
-     * Hints:
-     *   - it's a POST to the token endpoint, like the one in `callback`, but
-     *     with grant_type=refresh_token and refresh_token=<our refresh token>
-     *   - on success, save the new access token (and the new refresh token
-     *     and scope, if the response has them), then
-     *     `Redirect::to("/fetch_resource").into_response()` to try again
-     *   - on failure, forget the refresh token (the user has to log in
-     *     again) and show an error page
-     */
+    let refresh_token = s.refresh_token.clone().unwrap_or_default();
+    println!("Refreshing token {refresh_token}");
 
-    render("error", context! { error => "TODO: implement refresh_access_token in client/src/main.rs" })
+    let tok_res = reqwest::Client::new()
+        .post(AUTH_SERVER.token_endpoint)
+        .header(
+            "Authorization",
+            format!("Basic {}", encode_client_credentials(CLIENT.client_id, CLIENT.client_secret)),
+        )
+        .form(&[("grant_type", "refresh_token"), ("refresh_token", refresh_token.as_str())])
+        .send()
+        .await;
+
+    match tok_res {
+        Ok(res) if res.status().is_success() => {
+            let body: Value = res.json().await.unwrap_or_default();
+
+            s.access_token = body["access_token"].as_str().map(String::from);
+            println!("Got access token: {:?}", s.access_token);
+
+            if let Some(new_refresh_token) = body["refresh_token"].as_str() {
+                s.refresh_token = Some(new_refresh_token.to_string());
+                println!("Got refresh token: {new_refresh_token}");
+            }
+
+            s.scope = body["scope"].as_str().map(String::from);
+            println!("Got scope: {:?}", s.scope);
+
+            // try again
+            Redirect::to("/fetch_resource").into_response()
+        }
+        _ => {
+            println!("No refresh token, asking the user to get a new access token");
+            // tell the user to get a new access token
+            s.refresh_token = None;
+            render("error", context! { error => "Unable to refresh token." })
+        }
+    }
 }
 
 #[tokio::main]
