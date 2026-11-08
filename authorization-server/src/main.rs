@@ -4,15 +4,9 @@
 //! given to you finished, so you can see how the client and protected resource
 //! use it. In chapter 5 you build its endpoints yourself.
 //!
-//!
-//! EXERCISE 5-2 (book chapter 5): add refresh tokens.
-//!   - issue a refresh token along with the access token
-//!   - accept grant_type=refresh_token at the token endpoint
-//! Compare with the solution:  git diff ch5-ex2-done -- authorization-server
-//!
 //! Run it with:  cargo run -p authorization-server
 
-// Some helpers aren't used until a later exercise. This silences the
+// The scope helpers aren't used until exercise 5-3. This silences the
 // "unused" warnings until then.
 #![allow(unused)]
 
@@ -305,17 +299,7 @@ async fn token(
     // --- Which grant type is the client using? ---
     match param(&body, "grant_type") {
         "authorization_code" => authorization_code_grant(&app, client, &body).await,
-        /*
-         * TODO: Respond to a refresh token request by issuing a new access
-         * token. Add a "refresh_token" arm here that calls a new function
-         * (refresh_token_grant?) which:
-         *   - finds the refresh token: app.db.find_one(|doc| doc["refresh_token"] == refresh_token)
-         *     (not found → json_error(StatusCode::BAD_REQUEST, "invalid_grant"))
-         *   - checks it belongs to this client. If not, someone stole it:
-         *     delete it with app.db.remove(...) and answer invalid_grant
-         *   - issues and saves a new access token for the same client and user
-         *   - answers with the new access token and the same refresh token
-         */
+        "refresh_token" => refresh_token_grant(&app, client, &body),
         other => {
             println!("Unknown grant type {other}");
             json_error(StatusCode::BAD_REQUEST, "unsupported_grant_type")
@@ -344,25 +328,63 @@ async fn authorization_code_grant(
     }
 
     let access_token = random_string(32);
+    let refresh_token = random_string(32);
     app.db.insert(json!({
         "access_token": access_token,
         "client_id": client.client_id,
         "scope": code.scope,
         "user": code.user,
     }));
-
-    /*
-     * TODO: Issue a refresh token alongside the access token, save it to the
-     * database (like the access token, but under "refresh_token"), and put
-     * it in the response.
-     */
+    app.db.insert(json!({
+        "refresh_token": refresh_token,
+        "client_id": client.client_id,
+        "scope": code.scope,
+        "user": code.user,
+    }));
 
     println!("Issuing access token {access_token}");
+    println!("and refresh token {refresh_token}");
     println!("Issued tokens for code {code_value}");
 
     Json(json!({
         "access_token": access_token,
         "token_type": "Bearer",
+        "refresh_token": refresh_token,
+    }))
+    .into_response()
+}
+
+/// grant_type=refresh_token: trade a refresh token for a new access token,
+/// without bothering the user again.
+fn refresh_token_grant(app: &AppState, client: &Client, body: &HashMap<String, String>) -> Response {
+    let refresh_token = param(body, "refresh_token");
+
+    let Some(token) = app.db.find_one(|doc| doc["refresh_token"] == refresh_token) else {
+        println!("No matching token was found.");
+        return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
+    };
+    println!("We found a matching refresh token: {refresh_token}");
+
+    if token["client_id"] != client.client_id.as_str() {
+        // Someone is using another client's refresh token. Revoke it.
+        println!("Invalid client using a refresh token, expected {} got {}", token["client_id"], client.client_id);
+        app.db.remove(|doc| doc["refresh_token"] == refresh_token);
+        return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
+    }
+
+    let access_token = random_string(32);
+    app.db.insert(json!({
+        "access_token": access_token,
+        "client_id": client.client_id,
+        "scope": token["scope"],
+        "user": token["user"],
+    }));
+    println!("Issuing access token {access_token} for refresh token {refresh_token}");
+
+    Json(json!({
+        "access_token": access_token,
+        "token_type": "Bearer",
+        "refresh_token": refresh_token,
     }))
     .into_response()
 }
