@@ -8,6 +8,10 @@
         {% if client.logo_uri %}<p><b>logo:</b> <img src="{{ client.logo_uri }}" /></p>{% endif %}
 
         <form class="form" action="/approve" method="POST">
+          <label>Select user:</label>
+          <select name="user">
+            {% for user in users %}<option value="{{ user.preferred_username }}">{{ user.name }}</option>{% endfor %}
+          </select>
           <input type="hidden" name="reqid" value="{{ reqid }}">
           {% if scope %}
           <p>The client is requesting access to the following:</p>

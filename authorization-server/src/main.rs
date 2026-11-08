@@ -47,12 +47,52 @@ static CLIENTS: LazyLock<Vec<Client>> = LazyLock::new(|| {
         client_id: "oauth-client-1".into(),
         client_secret: "oauth-client-secret-1".into(),
         redirect_uris: vec!["http://localhost:9000/callback".into()],
-        scope: "foo bar read write delete fruit veggies meats".into(),
+        scope: "foo bar read write delete fruit veggies meats movies foods music".into(),
     }]
 });
 
 fn get_client(client_id: &str) -> Option<&'static Client> {
     CLIENTS.iter().find(|client| client.client_id == client_id)
+}
+
+// ---------------------------------------------------------------------------
+// Users (resource owners)
+// ---------------------------------------------------------------------------
+
+/// Someone who can approve clients. There are no passwords yet: the approval
+/// page simply asks which user you are.
+#[derive(Clone, Debug, Serialize)]
+struct User {
+    sub: String,
+    preferred_username: String,
+    name: String,
+    email: String,
+    email_verified: bool,
+}
+
+static USERS: LazyLock<Vec<User>> = LazyLock::new(|| {
+    vec![
+        User {
+            sub: "9XE3-JI34-00132A".into(),
+            preferred_username: "alice".into(),
+            name: "Alice".into(),
+            email: "alice.wonderland@example.com".into(),
+            email_verified: true,
+        },
+        User {
+            sub: "1ZT5-OE63-57383B".into(),
+            preferred_username: "bob".into(),
+            name: "Bob".into(),
+            email: "bob.loblob@example.net".into(),
+            email_verified: false,
+        },
+    ]
+});
+
+fn get_user(username: &str) -> Option<&'static User> {
+    USERS
+        .iter()
+        .find(|user| user.preferred_username == username)
 }
 
 // ---------------------------------------------------------------------------
@@ -66,6 +106,8 @@ struct CodeInfo {
     request: HashMap<String, String>,
     /// The scopes the user approved.
     scope: Vec<String>,
+    /// Who approved it (their `preferred_username`).
+    user: String,
 }
 
 /// The JS keeps these in global variables (`var codes = {}` and
@@ -175,7 +217,7 @@ async fn authorize(
 
     render(
         "approve",
-        context! { client => client, reqid => reqid, scope => rscope },
+        context! { client => client, reqid => reqid, scope => rscope, users => &*USERS },
     )
 }
 
@@ -206,6 +248,15 @@ async fn approve(
     }
 
     // user approved access
+    let username = param(&form, "user");
+    let Some(user) = get_user(username) else {
+        println!("Unknown user {username}");
+        return render(
+            "error",
+            context! { error => format!("Unknown user {username}") },
+        );
+    };
+
     let scope = scopes_from_form(&form);
     let client = get_client(param(&query, "client_id")).expect("client was checked in /authorize");
     if has_extra_scope(&scope, &split_scope(&client.scope)) {
@@ -228,6 +279,7 @@ async fn approve(
         CodeInfo {
             request: query,
             scope,
+            user: user.preferred_username.clone(),
         },
     );
 
@@ -318,11 +370,13 @@ async fn authorization_code_grant(
         "access_token": access_token,
         "client_id": client.client_id,
         "scope": code.scope,
+        "user": code.user,
     }));
     app.db.insert(json!({
         "refresh_token": refresh_token,
         "client_id": client.client_id,
         "scope": code.scope,
+        "user": code.user,
     }));
 
     let cscope = code.scope.join(" ");
@@ -370,6 +424,7 @@ fn refresh_token_grant(
         "access_token": access_token,
         "client_id": client.client_id,
         "scope": token["scope"],
+        "user": token["user"],
     }));
     println!("Issuing access token {access_token} for refresh token {refresh_token}");
 
