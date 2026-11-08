@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block content %}
+      <div class="row">
+        <div class="col-md-4">
+          <div class="well">
+            <h3>Read the current value</h3>
+            {% if result == "get" %}<p><span class="label label-success">Success</span></p>{% endif %}
+            {% if result == "noget" %}<p><span class="label label-danger">Failure</span></p>{% endif %}
+            {% if words %}<p>Words: {{ words }}</p>{% endif %}
+            {% if timestamp %}<p>Timestamp: {{ timestamp }}</p>{% endif %}
+            <a class="btn btn-info" href="/get_words">GET current value</a>
+          </div>
+        </div>
+        <div class="col-md-4">
+          <div class="well">
+            <h3>Add a word to the list</h3>
+            {% if result == "add" %}<p><span class="label label-success">Success</span></p>{% endif %}
+            {% if result == "noadd" %}<p><span class="label label-danger">Failure</span></p>{% endif %}
+            <form class="form" action="/add_word" method="GET">
+              <input type="text" name="word" placeholder="word">
+              <input type="submit" class="btn btn-warning" value="POST a new word">
+            </form>
+          </div>
+        </div>
+        <div class="col-md-4">
+          <div class="well">
+            <h3>Remove the last word from the list</h3>
+            {% if result == "rm" %}<p><span class="label label-success">Success</span></p>{% endif %}
+            {% if result == "norm" %}<p><span class="label label-danger">Failure</span></p>{% endif %}
+            <a class="btn btn-danger" href="/delete_word">DELETE the last word</a>
+          </div>
+        </div>
+      </div>
+      <p><a href="/">&larr; Back to the client home page</a></p>
+{% endblock %}
