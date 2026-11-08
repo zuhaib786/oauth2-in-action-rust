@@ -3,16 +3,7 @@
 //! APIs that only answer requests carrying a valid access token issued by
 //! the authorization server.
 //!
-//! EXERCISE 4-2 (book chapter 4): the Words API lets anyone with a valid token
-//! do anything. Make each of its three handlers require the right scope:
-//! GET needs "read", POST needs "write", DELETE needs "delete".
-//! Compare with the solution:  git diff ch4-ex2-done -- protected-resource
-//!
 //! Run it with:  cargo run -p protected-resource
-
-// Silences "unused variable/import" warnings until you've written your code.
-// Delete this line when you're done, to see if anything is left unused.
-#![allow(unused)]
 
 use std::{
     collections::HashMap,
@@ -23,7 +14,7 @@ use std::{
 use axum::{
     Json, Router,
     extract::{FromRequest, Request, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header::WWW_AUTHENTICATE},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -136,27 +127,25 @@ fn now_millis() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
+/// 403 Forbidden, telling the client which scope it was missing.
+fn insufficient_scope(scope: &str) -> Response {
+    let challenge =
+        format!(r#"Bearer realm=localhost:9002, error="insufficient_scope", scope="{scope}""#);
+    (StatusCode::FORBIDDEN, [(WWW_AUTHENTICATE, challenge)]).into_response()
+}
+
 async fn get_words(State(app): State<AppState>, token: AccessToken) -> Response {
-    /*
-     * TODO: Make this function require the "read" scope.
-     *
-     * Hints:
-     *   - token.has_scope("read") tells you if the token has it
-     *   - if it doesn't, answer 403 Forbidden and say which scope is missing:
-     *         (
-     *             StatusCode::FORBIDDEN,
-     *             [("WWW-Authenticate", r#"Bearer realm=localhost:9002, error="insufficient_scope", scope="read""#)],
-     *         )
-     *             .into_response()
-     */
+    if !token.has_scope("read") {
+        return insufficient_scope("read");
+    }
     let saved_words = app.saved_words.lock().await;
     Json(json!({ "words": saved_words.join(" "), "timestamp": now_millis() })).into_response()
 }
 
 async fn add_word(State(app): State<AppState>, token: AccessToken) -> Response {
-    /*
-     * TODO: Make this function require the "write" scope
-     */
+    if !token.has_scope("write") {
+        return insufficient_scope("write");
+    }
     if let Some(word) = token.form.get("word") {
         app.saved_words.lock().await.push(word.clone());
     }
@@ -164,9 +153,9 @@ async fn add_word(State(app): State<AppState>, token: AccessToken) -> Response {
 }
 
 async fn delete_word(State(app): State<AppState>, token: AccessToken) -> Response {
-    /*
-     * TODO: Make this function require the "delete" scope
-     */
+    if !token.has_scope("delete") {
+        return insufficient_scope("delete");
+    }
     app.saved_words.lock().await.pop();
     StatusCode::NO_CONTENT.into_response()
 }
