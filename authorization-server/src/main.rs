@@ -4,9 +4,18 @@
 //! given to you finished, so you can see how the client and protected resource
 //! use it. In chapter 5 you build its endpoints yourself.
 //!
+//!
+//! EXERCISE 5-3 (book chapter 5): add scopes. The client asks for scopes,
+//! but this server ignores them. Find the four TODOs:
+//!   - /authorize: reject scopes the client isn't registered for, and show
+//!     the requested scopes on the approval page
+//!   - /approve: check the scopes the user ticked, and remember them
+//!   - both grants: say which scopes the token has in the token response
+//! Compare with the solution:  git diff ch5-ex3-done -- authorization-server
+//!
 //! Run it with:  cargo run -p authorization-server
 
-// The scope helpers aren't used until exercise 5-3. This silences the
+// Some helpers aren't used until a later exercise. This silences the
 // "unused" warnings until then.
 #![allow(unused)]
 
@@ -201,9 +210,26 @@ async fn authorize(
         return render("error", context! { error => "Invalid redirect URI" });
     }
 
+    /*
+     * TODO: Validate that the set of scopes the client is requesting
+     * aligns with the set of scopes the client is registered for.
+     *
+     * Hints:
+     *   - split_scope("foo bar") gives vec!["foo", "bar"]; client.scope holds
+     *     the client's registered scopes in that "foo bar" form
+     *   - has_extra_scope(&requested, &allowed) is true if `requested` has
+     *     anything `allowed` doesn't
+     *   - if so: redirect_with_error(redirect_uri, "invalid_scope")
+     */
+
     let reqid = random_string(8);
     app.inner.lock().await.requests.insert(reqid.clone(), query.clone());
 
+    /*
+     * TODO: Send the requested scopes to the approval page for rendering
+     * (add `scope => <the list of requested scopes>` to the context). The
+     * page shows a checkbox for each.
+     */
     render("approve", context! { client => client, reqid => reqid, users => &*USERS })
 }
 
@@ -237,6 +263,12 @@ async fn approve(
         return render("error", context! { error => format!("Unknown user {username}") });
     };
 
+    /*
+     * TODO: Make sure the approved scopes from the form are allowed for this
+     * client. scopes_from_form(&form) gives you the ticked ones. If any isn't
+     * allowed: redirect_with_error(redirect_uri, "invalid_scope")
+     */
+
     let code = random_string(8);
 
     // The client must get back exactly the `state` it sent us.
@@ -249,6 +281,7 @@ async fn approve(
     // save the code and request for later
     state.codes.insert(
         code.clone(),
+        // TODO: save the approved scopes here instead of an empty list
         CodeInfo { request: query, scope: Vec::new(), user: user.preferred_username.clone() },
     );
 
@@ -350,6 +383,7 @@ async fn authorization_code_grant(
         "access_token": access_token,
         "token_type": "Bearer",
         "refresh_token": refresh_token,
+        // TODO: Return scopes as part of the token response: "scope": "foo bar"
     }))
     .into_response()
 }
@@ -385,6 +419,8 @@ fn refresh_token_grant(app: &AppState, client: &Client, body: &HashMap<String, S
         "access_token": access_token,
         "token_type": "Bearer",
         "refresh_token": refresh_token,
+        // TODO: Return scopes here too. The stored token["scope"] is a JSON
+        // list like ["foo", "bar"]; the response needs the string "foo bar".
     }))
     .into_response()
 }
