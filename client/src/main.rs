@@ -16,7 +16,7 @@ use axum::{
     routing::get,
 };
 use oauth_common::{build_url, context, encode_client_credentials, param, random_string, render};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 // authorization server information
@@ -43,11 +43,12 @@ const CLIENT: ClientInfo = ClientInfo {
     client_id: "oauth-client-1",
     client_secret: "oauth-client-secret-1",
     redirect_uris: &["http://localhost:9000/callback"],
-    scope: "foo bar read write delete",
+    scope: "foo bar read write delete fruit veggies meats",
 };
 
 const PROTECTED_RESOURCE: &str = "http://localhost:9002/resource";
 const WORDS_API: &str = "http://localhost:9002/words";
+const PRODUCE_API: &str = "http://localhost:9002/produce";
 
 /// The JS keeps these in global variables (`var state = null;` etc.).
 /// Here they live in one struct behind a lock that every handler can reach
@@ -307,6 +308,25 @@ async fn delete_word(State(app): State<AppState>) -> Response {
     words_page("", 0, if worked { "rm" } else { "norm" })
 }
 
+// ---------------------------------------------------------------------------
+// Produce API (chapter 4)
+// ---------------------------------------------------------------------------
+
+async fn produce(State(app): State<AppState>) -> Response {
+    let s = app.lock().await;
+    let res = reqwest::Client::new()
+        .get(PRODUCE_API)
+        .header("Authorization", bearer(&s))
+        .send()
+        .await;
+
+    let data: Value = match res {
+        Ok(res) if res.status().is_success() => res.json().await.unwrap_or_default(),
+        _ => json!({ "fruit": [], "veggies": [], "meats": [] }),
+    };
+    render("produce", context! { scope => s.scope, data => data })
+}
+
 #[tokio::main]
 async fn main() {
     oauth_common::set_views_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/templates"));
@@ -320,6 +340,7 @@ async fn main() {
         .route("/get_words", get(get_words))
         .route("/add_word", get(add_word))
         .route("/delete_word", get(delete_word))
+        .route("/produce", get(produce))
         .with_state(AppState::default());
 
     oauth_common::serve(app, 9000, "OAuth Client").await;

@@ -3,7 +3,16 @@
 //! APIs that only answer requests carrying a valid access token issued by
 //! the authorization server.
 //!
+//! EXERCISE 4-3 (book chapter 4): the Produce API sends every kind of produce
+//! to everyone. Make `produce` include fruit, veggies and meats only when the
+//! token has the "fruit", "veggies" and "meats" scope respectively.
+//! Compare with the solution:  git diff ch4-ex3-done -- protected-resource
+//!
 //! Run it with:  cargo run -p protected-resource
+
+// Silences "unused variable/import" warnings until you've written your code.
+// Delete this line when you're done, to see if anything is left unused.
+#![allow(unused)]
 
 use std::{
     collections::HashMap,
@@ -160,6 +169,27 @@ async fn delete_word(State(app): State<AppState>, token: AccessToken) -> Respons
     StatusCode::NO_CONTENT.into_response()
 }
 
+async fn produce(token: AccessToken) -> Response {
+    let produce = json!({
+        "fruit": ["apple", "banana", "kiwi"],
+        "veggies": ["lettuce", "onion", "potato"],
+        "meats": ["bacon", "steak", "chicken breast"],
+    });
+
+    /*
+     * TODO: Add different kinds of produce based on the incoming token's scope
+     *
+     * Hints:
+     *   - start from json!({ "fruit": [], "veggies": [], "meats": [] }) and
+     *     fill in a list when the token has its scope
+     *   - a serde_json Value can be changed like a JS object:
+     *         produce["fruit"] = json!(["apple", "banana", "kiwi"]);
+     *     (the variable has to be `let mut` for that)
+     */
+
+    Json(produce).into_response()
+}
+
 #[tokio::main]
 async fn main() {
     oauth_common::set_views_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/templates"));
@@ -170,6 +200,7 @@ async fn main() {
         .route("/", get(|| async { render("index", context! {}) }))
         .route("/resource", post(resource))
         .route("/words", get(get_words).post(add_word).delete(delete_word))
+        .route("/produce", get(produce))
         .layer(CorsLayer::permissive()) // `app.use(cors())`
         .with_state(state);
 

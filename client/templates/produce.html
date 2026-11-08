@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block content %}
+      <div class="jumbotron">
+        <h2>Produce API</h2>
+        <p>Current scope: <span class="label label-info">{{ scope }}</span></p>
+        <p>Fruits:</p>
+        <ul>{% for v in data.fruit %}<li>{{ v }}</li>{% endfor %}</ul>
+        <p>Veggies:</p>
+        <ul>{% for v in data.veggies %}<li>{{ v }}</li>{% endfor %}</ul>
+        <p>Meats:</p>
+        <ul>{% for v in data.meats %}<li>{{ v }}</li>{% endfor %}</ul>
+        <a href="/produce" class="btn btn-default">Get Produce</a>
+      </div>
+      <p><a href="/">&larr; Back to the client home page</a></p>
+{% endblock %}

@@ -45,7 +45,7 @@ static CLIENTS: LazyLock<Vec<Client>> = LazyLock::new(|| {
         client_id: "oauth-client-1".into(),
         client_secret: "oauth-client-secret-1".into(),
         redirect_uris: vec!["http://localhost:9000/callback".into()],
-        scope: "foo bar read write delete".into(),
+        scope: "foo bar read write delete fruit veggies meats".into(),
     }]
 });
 
