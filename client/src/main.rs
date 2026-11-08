@@ -9,8 +9,6 @@
 
 // Silences "unused variable/import" warnings until you've written your code.
 // Delete this line when you're done, to see if anything is left unused.
-#![allow(unused)]
-
 use std::{collections::HashMap, sync::Arc};
 
 use axum::{
@@ -45,8 +43,8 @@ struct ClientInfo {
  * Add the client information in here
  */
 const CLIENT: ClientInfo = ClientInfo {
-    client_id: "",
-    client_secret: "",
+    client_id: "oauth-client-1",
+    client_secret: "oauth-client-secret-1",
     redirect_uris: &["http://localhost:9000/callback"],
 };
 
@@ -70,7 +68,10 @@ type AppState = Arc<Mutex<ClientState>>;
 
 async fn index(State(app): State<AppState>) -> Response {
     let s = app.lock().await;
-    render("index", context! { access_token => s.access_token, scope => s.scope })
+    render(
+        "index",
+        context! { access_token => s.access_token, scope => s.scope },
+    )
 }
 
 async fn authorize(State(app): State<AppState>) -> Response {
@@ -81,8 +82,18 @@ async fn authorize(State(app): State<AppState>) -> Response {
      *   - build_url(base, &[("key", "value"), ...]) builds a URL with a query string
      *   - Redirect::to(&url).into_response() sends the browser there
      */
-
-    render("error", context! { error => "TODO: implement /authorize in client/src/main.rs" })
+    let mut s = app.lock().await;
+    s.state = Some(random_string(20));
+    let uri = build_url(
+        AUTH_SERVER.authorization_endpoint,
+        &[
+            ("response_type", "code"),
+            ("client_id", CLIENT.client_id),
+            ("redirect_uri", CLIENT.redirect_uris[0]),
+            ("state", s.state.as_ref().unwrap()),
+        ],
+    );
+    Redirect::to(&uri).into_response()
 }
 
 async fn callback(
@@ -104,8 +115,76 @@ async fn callback(
      *   - `res` is a Result: Ok(response) or Err(network error)
      *   - response.status().is_success() and response.json::<Value>().await
      */
+    let mut s = app.lock().await;
+    // Handle deny
+    if let Some(deny) = params.get("error") {
+        return render(
+            "error",
+            context! {error => format!("Authorization Request denied: {}", deny)},
+        );
+    }
+    // Get the code
+    if let Some(code) = params.get("code") {
+        // run the code on the token fetch endpoint
 
-    render("error", context! { error => "TODO: implement /callback in client/src/main.rs" })
+        if params.get("state") != s.state.as_ref() {
+            return render("error", context! {error => "Invalid state returned"});
+        }
+        let res = reqwest::Client::new()
+            .post(AUTH_SERVER.token_endpoint)
+            .header(
+                "Authorization",
+                format!(
+                    "Basic {}",
+                    encode_client_credentials(CLIENT.client_id, CLIENT.client_secret)
+                ),
+            )
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("code", code),
+                ("redirect_uri", CLIENT.redirect_uris[0]),
+            ])
+            .send()
+            .await;
+        match res {
+            Ok(response) => {
+                // on success
+                if response.status().is_success() {
+                    let body = if let Ok(body) = response.json::<Value>().await {
+                        body
+                    } else {
+                        return render("error", context! {error => "Failed to parse json"});
+                    };
+
+                    let Some(access_token) = body["access_token"].as_str() else {
+                        return render(
+                            "error",
+                            context! {error => "Access token not returned by the endpoint"},
+                        );
+                    };
+                    s.access_token = Some(access_token.to_owned());
+                    render(
+                        "index",
+                        context! {access_token => s.access_token, scope => s.scope},
+                    )
+                } else {
+                    render(
+                        "error",
+                        context! {error => format!("Could not reach the token endpoint successfully. Status code: {}", response.status())},
+                    )
+                }
+            }
+            Err(err) => render(
+                "error",
+                context! {error => format!("Could not connect: {err}")},
+            ),
+        }
+    } else {
+        render(
+            "error",
+            context! {error => "Invalid authorization request. Code param is required"},
+        )
+    }
 }
 
 async fn fetch_resource(State(app): State<AppState>) -> Response {
@@ -116,7 +195,39 @@ async fn fetch_resource(State(app): State<AppState>) -> Response {
      *   - render("data", context! { resource => body }) shows the JSON you got back
      */
 
-    render("error", context! { error => "TODO: implement /fetch_resource in client/src/main.rs" })
+    let s = app.lock().await;
+    let Some(access_token) = s.access_token.as_ref() else {
+        return render(
+            "error",
+            context! {error => "Unauthorized Request. Please authenticate first"},
+        );
+    };
+    let resp = reqwest::Client::new()
+        .post(PROTECTED_RESOURCE)
+        .header("Authorization", format!("Bearer {}", access_token))
+        .send()
+        .await;
+    match resp {
+        Ok(response) => {
+            if response.status().is_success() {
+                let body = if let Ok(body) = response.json::<Value>().await {
+                    body
+                } else {
+                    return render("error", context! {error => "Failed to parse json"});
+                };
+                render("data", context! {resource => body})
+            } else {
+                render(
+                    "error",
+                    context! {error => format!("Request failed with status code: {}",response.status())},
+                )
+            }
+        }
+        Err(err) => render(
+            "error",
+            context! {error => format!("Error while fetching the resource: {err}")},
+        ),
+    }
 }
 
 #[tokio::main]
