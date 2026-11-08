@@ -20,7 +20,7 @@ use axum::{
 };
 use oauth_common::{Db, build_url, context, decode_client_credentials, param, random_string, render};
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 // authorization server information
@@ -257,6 +257,7 @@ async fn token(
     // --- Which grant type is the client using? ---
     match param(&body, "grant_type") {
         "authorization_code" => authorization_code_grant(&app, client, &body).await,
+        "refresh_token" => refresh_token_grant(&app, client, &body),
         other => {
             println!("Unknown grant type {other}");
             json_error(StatusCode::BAD_REQUEST, "unsupported_grant_type")
@@ -285,19 +286,75 @@ async fn authorization_code_grant(
     }
 
     let access_token = random_string(32);
+    let refresh_token = random_string(32);
     app.db.insert(json!({
         "access_token": access_token,
+        "client_id": client.client_id,
+        "scope": code.scope,
+    }));
+    app.db.insert(json!({
+        "refresh_token": refresh_token,
         "client_id": client.client_id,
         "scope": code.scope,
     }));
 
     let cscope = code.scope.join(" ");
     println!("Issuing access token {access_token}");
+    println!("and refresh token {refresh_token}");
     println!("with scope {cscope}");
     println!("Issued tokens for code {code_value}");
 
-    Json(json!({ "access_token": access_token, "token_type": "Bearer", "scope": cscope }))
-        .into_response()
+    Json(json!({
+        "access_token": access_token,
+        "token_type": "Bearer",
+        "refresh_token": refresh_token,
+        "scope": cscope,
+    }))
+    .into_response()
+}
+
+/// grant_type=refresh_token: trade a refresh token for a new access token,
+/// without bothering the user again.
+fn refresh_token_grant(app: &AppState, client: &Client, body: &HashMap<String, String>) -> Response {
+    let refresh_token = param(body, "refresh_token");
+
+    let Some(token) = app.db.find_one(|doc| doc["refresh_token"] == refresh_token) else {
+        println!("No matching token was found.");
+        return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
+    };
+    println!("We found a matching refresh token: {refresh_token}");
+
+    if token["client_id"] != client.client_id.as_str() {
+        // Someone is using another client's refresh token. Revoke it.
+        println!("Invalid client using a refresh token, expected {} got {}", token["client_id"], client.client_id);
+        app.db.remove(|doc| doc["refresh_token"] == refresh_token);
+        return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
+    }
+
+    let access_token = random_string(32);
+    app.db.insert(json!({
+        "access_token": access_token,
+        "client_id": client.client_id,
+        "scope": token["scope"],
+    }));
+    println!("Issuing access token {access_token} for refresh token {refresh_token}");
+
+    Json(json!({
+        "access_token": access_token,
+        "token_type": "Bearer",
+        "refresh_token": refresh_token,
+        "scope": scope_to_string(&token["scope"]),
+    }))
+    .into_response()
+}
+
+/// Turns a scope list stored in the database (`["foo", "bar"]`) back into
+/// the space-separated string OAuth uses on the wire (`"foo bar"`).
+fn scope_to_string(scope: &Value) -> String {
+    scope
+        .as_array()
+        .map(|list| list.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "))
+        .unwrap_or_default()
 }
 
 #[tokio::main]
@@ -307,6 +364,14 @@ async fn main() {
     let db = Db::shared();
     // clear the database on startup
     db.clear();
+
+    // Exercise 3-2: a pre-baked refresh token, so the client can practice
+    // refreshing before it has ever logged in.
+    db.insert(json!({
+        "refresh_token": "j2r3oj32r23rmasd98uhjrk2o3i",
+        "client_id": "oauth-client-1",
+        "scope": ["foo", "bar"],
+    }));
 
     let state = AppState { inner: Arc::default(), db };
 
