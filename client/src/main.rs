@@ -5,13 +5,13 @@
 //!   1. in `fetch_resource`, when the protected resource says no, call
 //!      `refresh_access_token` instead of showing an error
 //!   2. fill in `refresh_access_token`
+//!
 //! Compare with the solution:  git diff ch3-ex2-done -- client
 //!
 //! Run it with:  cargo run -p client
 
 // Silences "unused variable/import" warnings until you've written your code.
 // Delete this line when you're done, to see if anything is left unused.
-#![allow(unused)]
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -126,7 +126,11 @@ async fn callback(
     let mut s = app.lock().await;
 
     if params.get("state") != s.state.as_ref() {
-        println!("State DOES NOT MATCH: expected {:?} got {:?}", s.state, params.get("state"));
+        println!(
+            "State DOES NOT MATCH: expected {:?} got {:?}",
+            s.state,
+            params.get("state")
+        );
         return render("error", context! { error => "State value did not match" });
     }
 
@@ -138,7 +142,10 @@ async fn callback(
         .post(AUTH_SERVER.token_endpoint)
         .header(
             "Authorization",
-            format!("Basic {}", encode_client_credentials(CLIENT.client_id, CLIENT.client_secret)),
+            format!(
+                "Basic {}",
+                encode_client_credentials(CLIENT.client_id, CLIENT.client_secret)
+            ),
         )
         // `.form(...)` sends the body as application/x-www-form-urlencoded
         .form(&[
@@ -153,7 +160,10 @@ async fn callback(
     let tok_res = match tok_res {
         Ok(res) => res,
         Err(err) => {
-            return render("error", context! { error => format!("Token request failed: {err}") });
+            return render(
+                "error",
+                context! { error => format!("Token request failed: {err}") },
+            );
         }
     };
 
@@ -202,7 +212,7 @@ async fn fetch_resource(State(app): State<AppState>) -> Response {
             let body: Value = res.json().await.unwrap_or_default();
             render("data", context! { resource => body })
         }
-        Ok(res) => {
+        Ok(_res) => {
             /*
              * TODO: Instead of always returning an error like we do here,
              * refresh the access token if we have a refresh token.
@@ -210,13 +220,13 @@ async fn fetch_resource(State(app): State<AppState>) -> Response {
              * Hint: `refresh_access_token(&mut s).await` hands our state to
              * the function below.
              */
-            println!("resource status error code {}", res.status());
-            render(
-                "error",
-                context! { error => format!("Unable to fetch resource. Status {}", res.status().as_u16()) },
-            )
+            println!("Refreshing access token");
+            refresh_access_token(&mut s).await
         }
-        Err(err) => render("error", context! { error => format!("Resource request failed: {err}") }),
+        Err(err) => render(
+            "error",
+            context! { error => format!("Resource request failed: {err}") },
+        ),
     }
 }
 
@@ -236,7 +246,57 @@ async fn refresh_access_token(s: &mut ClientState) -> Response {
      *     again) and show an error page
      */
 
-    render("error", context! { error => "TODO: implement refresh_access_token in client/src/main.rs" })
+    s.access_token = None;
+    let Some(refresh_token) = s.refresh_token.as_ref() else {
+        return render("error", context! {error => "No usable refresh token found"});
+    };
+    let res = reqwest::Client::new()
+        .post(AUTH_SERVER.token_endpoint)
+        .header(
+            "Authorization",
+            format!(
+                "Basic {}",
+                encode_client_credentials(CLIENT.client_id, CLIENT.client_secret)
+            ),
+        )
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+        ])
+        .send()
+        .await;
+    match res {
+        Ok(response) if response.status().is_success() => {
+            let body = if let Ok(body) = response.json::<Value>().await {
+                body
+            } else {
+                return render("error", context! {error => "Failed to parse json"});
+            };
+            let Some(access_token) = body["access_token"].as_str() else {
+                return render("error", context! {error => "No access token returned"});
+            };
+            let ref_token = if let Some(token) = body["refresh_token"].as_str() {
+                token
+            } else {
+                refresh_token
+            }; // old refresh token only if not returned
+            s.access_token = Some(access_token.to_owned());
+            s.refresh_token = Some(ref_token.to_owned());
+            Redirect::to("/fetch_resource").into_response()
+        }
+        Ok(response) => {
+            s.refresh_token = None;
+            s.access_token = None;
+            render(
+                "error",
+                context! {error => format!("Request failed with status code: {}", response.status())},
+            )
+        }
+        Err(err) => render(
+            "error",
+            context! {error => format!("Request failed with error : {err}")},
+        ),
+    }
 }
 
 #[tokio::main]
