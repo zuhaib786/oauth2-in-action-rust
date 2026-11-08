@@ -1,0 +1,16 @@
+[package]
+name = "oauth-common"
+version = "0.1.0"
+edition = "2024"
+description = "Small helpers shared by every exercise (replaces the npm packages the Node.js code used)"
+
+[dependencies]
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+minijinja.workspace = true
+url.workspace = true
+rand.workspace = true
+base64.workspace = true
+urlencoding.workspace = true
