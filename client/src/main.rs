@@ -1,15 +1,9 @@
 //! The OAuth client (http://localhost:9000).
 //!
-//! EXERCISE 3-1 (book chapter 3): fill in the three handlers marked TODO
-//! (`authorize`, `callback`, `fetch_resource`) plus the client credentials.
-//! Everything you need is already imported.
-//! Compare with the solution:  git diff ch3-ex1-done -- client
+//! It gets an access token from the authorization server using the
+//! authorization code grant, then uses it to call the protected resource.
 //!
 //! Run it with:  cargo run -p client
-
-// Silences "unused variable/import" warnings until you've written your code.
-// Delete this line when you're done, to see if anything is left unused.
-#![allow(unused)]
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -41,12 +35,9 @@ struct ClientInfo {
     redirect_uris: &'static [&'static str],
 }
 
-/*
- * Add the client information in here
- */
 const CLIENT: ClientInfo = ClientInfo {
-    client_id: "",
-    client_secret: "",
+    client_id: "oauth-client-1",
+    client_secret: "oauth-client-secret-1",
     redirect_uris: &["http://localhost:9000/callback"],
 };
 
@@ -55,10 +46,6 @@ const PROTECTED_RESOURCE: &str = "http://localhost:9002/resource";
 /// The JS keeps these in global variables (`var state = null;` etc.).
 /// Here they live in one struct behind a lock that every handler can reach
 /// through `State(app)`. `Option<String>` plays the role of "string or null".
-///
-/// To read or change them inside a handler:
-///     let mut s = app.lock().await;
-///     s.state = Some(random_string(32));
 #[derive(Default)]
 struct ClientState {
     state: Option<String>,
@@ -74,49 +61,116 @@ async fn index(State(app): State<AppState>) -> Response {
 }
 
 async fn authorize(State(app): State<AppState>) -> Response {
-    /*
-     * Send the user to the authorization server
-     *
-     * Hints:
-     *   - build_url(base, &[("key", "value"), ...]) builds a URL with a query string
-     *   - Redirect::to(&url).into_response() sends the browser there
-     */
+    let mut s = app.lock().await;
+    s.access_token = None;
 
-    render("error", context! { error => "TODO: implement /authorize in client/src/main.rs" })
+    let state = random_string(32);
+    s.state = Some(state.clone());
+
+    let authorize_url = build_url(
+        AUTH_SERVER.authorization_endpoint,
+        &[
+            ("response_type", "code"),
+            ("client_id", CLIENT.client_id),
+            ("redirect_uri", CLIENT.redirect_uris[0]),
+            ("state", &state),
+        ],
+    );
+
+    println!("redirect {authorize_url}");
+    Redirect::to(&authorize_url).into_response()
 }
 
 async fn callback(
     State(app): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    /*
-     * Parse the response from the authorization server and get a token
-     *
-     * Hints:
-     *   - params.get("code") is `req.query.code`; it gives an Option<&String>
-     *   - an HTTP POST with a form body looks like:
-     *         let res = reqwest::Client::new()
-     *             .post(url)
-     *             .header("Authorization", format!("Basic {}", ...))
-     *             .form(&[("key", "value"), ...])
-     *             .send()
-     *             .await;
-     *   - `res` is a Result: Ok(response) or Err(network error)
-     *   - response.status().is_success() and response.json::<Value>().await
-     */
+    if let Some(error) = params.get("error") {
+        // it's an error response, act accordingly
+        return render("error", context! { error => error });
+    }
 
-    render("error", context! { error => "TODO: implement /callback in client/src/main.rs" })
+    let mut s = app.lock().await;
+
+    if params.get("state") != s.state.as_ref() {
+        println!(
+            "State DOES NOT MATCH: expected {:?} got {:?}",
+            s.state,
+            params.get("state")
+        );
+        return render("error", context! { error => "State value did not match" });
+    }
+
+    let code = params.get("code").map(String::as_str).unwrap_or("");
+
+    println!("Requesting access token for code {code}");
+
+    let tok_res = reqwest::Client::new()
+        .post(AUTH_SERVER.token_endpoint)
+        .header(
+            "Authorization",
+            format!("Basic {}", encode_client_credentials(CLIENT.client_id, CLIENT.client_secret)),
+        )
+        // `.form(...)` sends the body as application/x-www-form-urlencoded
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", CLIENT.redirect_uris[0]),
+        ])
+        .send()
+        .await;
+
+    // Unlike JS, Rust makes us handle "the server didn't answer at all".
+    let tok_res = match tok_res {
+        Ok(res) => res,
+        Err(err) => {
+            return render("error", context! { error => format!("Token request failed: {err}") });
+        }
+    };
+
+    if tok_res.status().is_success() {
+        let body: Value = tok_res.json().await.unwrap_or_default();
+
+        s.access_token = body["access_token"].as_str().map(String::from);
+        println!("Got access token: {:?}", s.access_token);
+
+        render("index", context! { access_token => s.access_token, scope => s.scope })
+    } else {
+        render(
+            "error",
+            context! {
+                error => format!("Unable to fetch access token, server response: {}", tok_res.status().as_u16())
+            },
+        )
+    }
 }
 
 async fn fetch_resource(State(app): State<AppState>) -> Response {
-    /*
-     * Use the access token to call the resource server
-     *
-     * Hints:
-     *   - render("data", context! { resource => body }) shows the JSON you got back
-     */
+    let mut s = app.lock().await;
 
-    render("error", context! { error => "TODO: implement /fetch_resource in client/src/main.rs" })
+    let Some(access_token) = s.access_token.clone() else {
+        return render("error", context! { error => "Missing Access Token" });
+    };
+
+    println!("Making request with access token {access_token}");
+
+    let resource = reqwest::Client::new()
+        .post(PROTECTED_RESOURCE)
+        .header("Authorization", format!("Bearer {access_token}"))
+        .send()
+        .await;
+
+    match resource {
+        Ok(res) if res.status().is_success() => {
+            let body: Value = res.json().await.unwrap_or_default();
+            render("data", context! { resource => body })
+        }
+        Ok(res) => {
+            s.access_token = None;
+            render("error", context! { error => res.status().as_u16() })
+        }
+        Err(err) => render("error", context! { error => format!("Resource request failed: {err}") }),
+    }
 }
 
 #[tokio::main]
