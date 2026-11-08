@@ -4,9 +4,15 @@
 //! given to you finished, so you can see how the client and protected resource
 //! use it. In chapter 5 you build its endpoints yourself.
 //!
+//!
+//! EXERCISE 5-2 (book chapter 5): add refresh tokens.
+//!   - issue a refresh token along with the access token
+//!   - accept grant_type=refresh_token at the token endpoint
+//! Compare with the solution:  git diff ch5-ex2-done -- authorization-server
+//!
 //! Run it with:  cargo run -p authorization-server
 
-// The scope helpers aren't used until exercise 5-3. This silences the
+// Some helpers aren't used until a later exercise. This silences the
 // "unused" warnings until then.
 #![allow(unused)]
 
@@ -299,6 +305,17 @@ async fn token(
     // --- Which grant type is the client using? ---
     match param(&body, "grant_type") {
         "authorization_code" => authorization_code_grant(&app, client, &body).await,
+        /*
+         * TODO: Respond to a refresh token request by issuing a new access
+         * token. Add a "refresh_token" arm here that calls a new function
+         * (refresh_token_grant?) which:
+         *   - finds the refresh token: app.db.find_one(|doc| doc["refresh_token"] == refresh_token)
+         *     (not found → json_error(StatusCode::BAD_REQUEST, "invalid_grant"))
+         *   - checks it belongs to this client. If not, someone stole it:
+         *     delete it with app.db.remove(...) and answer invalid_grant
+         *   - issues and saves a new access token for the same client and user
+         *   - answers with the new access token and the same refresh token
+         */
         other => {
             println!("Unknown grant type {other}");
             json_error(StatusCode::BAD_REQUEST, "unsupported_grant_type")
@@ -333,6 +350,12 @@ async fn authorization_code_grant(
         "scope": code.scope,
         "user": code.user,
     }));
+
+    /*
+     * TODO: Issue a refresh token alongside the access token, save it to the
+     * database (like the access token, but under "refresh_token"), and put
+     * it in the response.
+     */
 
     println!("Issuing access token {access_token}");
     println!("Issued tokens for code {code_value}");
