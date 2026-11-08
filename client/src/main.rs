@@ -51,24 +51,12 @@ const PROTECTED_RESOURCE: &str = "http://localhost:9002/resource";
 /// The JS keeps these in global variables (`var state = null;` etc.).
 /// Here they live in one struct behind a lock that every handler can reach
 /// through `State(app)`. `Option<String>` plays the role of "string or null".
+#[derive(Default)]
 struct ClientState {
     state: Option<String>,
     access_token: Option<String>,
     scope: Option<String>,
     refresh_token: Option<String>,
-}
-
-impl ClientState {
-    fn new() -> Self {
-        ClientState {
-            state: None,
-            // Exercise 3-2: the authorization server doesn't know this access
-            // token, but it does know this refresh token.
-            access_token: Some("987tghjkiu6trfghjuytrghj".into()),
-            scope: None,
-            refresh_token: Some("j2r3oj32r23rmasd98uhjrk2o3i".into()),
-        }
-    }
 }
 
 type AppState = Arc<Mutex<ClientState>>;
@@ -262,7 +250,7 @@ async fn main() {
         .route("/authorize", get(authorize))
         .route("/callback", get(callback))
         .route("/fetch_resource", get(fetch_resource))
-        .with_state(Arc::new(Mutex::new(ClientState::new())));
+        .with_state(AppState::default());
 
     oauth_common::serve(app, 9000, "OAuth Client").await;
 }

@@ -365,14 +365,6 @@ async fn main() {
     // clear the database on startup
     db.clear();
 
-    // Exercise 3-2: a pre-baked refresh token, so the client can practice
-    // refreshing before it has ever logged in.
-    db.insert(json!({
-        "refresh_token": "j2r3oj32r23rmasd98uhjrk2o3i",
-        "client_id": "oauth-client-1",
-        "scope": ["foo", "bar"],
-    }));
-
     let state = AppState { inner: Arc::default(), db };
 
     let app = Router::new()

@@ -1,9 +1,17 @@
 //! The OAuth protected resource (http://localhost:9002).
 //!
 //! An API that only answers requests carrying a valid access token issued by
-//! the authorization server. You work on this in chapter 4.
+//! the authorization server.
+//!
+//! EXERCISE 4-1 (book chapter 4): right now anyone gets the data, token or
+//! not. Fill in `get_access_token` and use it in `resource`.
+//! Compare with the solution:  git diff ch4-ex1-done -- protected-resource
 //!
 //! Run it with:  cargo run -p protected-resource
+
+// Silences "unused variable/import" warnings until you've written your code.
+// Delete this line when you're done, to see if anything is left unused.
+#![allow(unused)]
 
 use std::collections::HashMap;
 
@@ -31,26 +39,21 @@ fn get_access_token(
     query: &HashMap<String, String>,
     form: &HashMap<String, String>,
 ) -> Option<Value> {
-    let auth = headers.get("authorization").and_then(|v| v.to_str().ok());
+    /*
+     * TODO: Scan for an access token on the incoming request.
+     *
+     * Hints:
+     *   - look in this order: the Authorization header ("Bearer <token>",
+     *     any capitalization of "bearer"), then form.get("access_token"),
+     *     then query.get("access_token")
+     *   - headers.get("authorization").and_then(|v| v.to_str().ok()) gives
+     *     an Option<&str> with the header's text
+     *   - db.find_one(|doc| doc["access_token"] == token) finds the stored
+     *     token record (token must be a &str here)
+     *   - println! what you find; the logs help a lot when debugging
+     */
 
-    let in_token = if let Some(auth) = auth.filter(|a| a.to_lowercase().starts_with("bearer ")) {
-        Some(auth["bearer ".len()..].to_string())
-    } else if let Some(token) = form.get("access_token") {
-        // not in the header, check in the form body
-        Some(token.clone())
-    } else {
-        query.get("access_token").cloned()
-    };
-
-    println!("Incoming token: {}", in_token.as_deref().unwrap_or("(none)"));
-    let in_token = in_token?;
-
-    let found = db.find_one(|doc| doc["access_token"] == in_token.as_str());
-    match &found {
-        Some(_) => println!("We found a matching token: {in_token}"),
-        None => println!("No matching token was found."),
-    }
-    found
+    None
 }
 
 async fn resource(
@@ -60,14 +63,17 @@ async fn resource(
     body: String,
 ) -> Response {
     let form = parse_form(&body);
-    match get_access_token(&db, &headers, &query, &form) {
-        Some(_token) => Json(json!({
-            "name": "Protected Resource",
-            "description": "This data has been protected by OAuth 2.0"
-        }))
-        .into_response(),
-        None => StatusCode::UNAUTHORIZED.into_response(),
-    }
+
+    /*
+     * TODO: Call get_access_token. Only send the resource if a valid token
+     * was found. Otherwise answer with StatusCode::UNAUTHORIZED.into_response()
+     */
+
+    Json(json!({
+        "name": "Protected Resource",
+        "description": "This data has been protected by OAuth 2.0"
+    }))
+    .into_response()
 }
 
 #[tokio::main]
