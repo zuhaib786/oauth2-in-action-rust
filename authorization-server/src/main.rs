@@ -1099,10 +1099,11 @@ fn client_from_metadata(metadata: ClientMetadata) -> Result<Client, InvalidMetad
 
     let uses_code = grant_types.iter().any(|g| g == "authorization_code");
     let expected_response_types: &[&str] = if uses_code { &["code"] } else { &[] };
-    if let Some(response_types) = metadata.response_types {
-        if !response_types.iter().map(String::as_str).eq(expected_response_types.iter().copied()) {
-            return Err(InvalidMetadata::client_metadata("response_types don't match grant_types"));
-        }
+    let mismatched = metadata
+        .response_types
+        .is_some_and(|types| !types.iter().map(String::as_str).eq(expected_response_types.iter().copied()));
+    if mismatched {
+        return Err(InvalidMetadata::client_metadata("response_types don't match grant_types"));
     }
 
     let redirect_uris = metadata.redirect_uris.unwrap_or_default();
