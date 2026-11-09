@@ -3,21 +3,30 @@
 //! It gets an access token from the authorization server using the
 //! authorization code grant, then uses it to call the protected resource.
 //! When the access token stops working, it gets a new one with the
-//! refresh token.
+//! refresh token. Each browser gets its own session (chapter 7).
 //!
 //! Run it with:  cargo run -p client
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex as StdMutex},
+};
 
 use axum::{
-    Router,
-    extract::{Query, State},
+    Extension, Router,
+    extract::{Query, Request, State},
+    http::{
+        HeaderMap, HeaderValue, StatusCode,
+        header::{COOKIE, REFERRER_POLICY, SET_COOKIE},
+    },
+    middleware::{self, Next},
     response::{IntoResponse, Redirect, Response},
     routing::get,
 };
 use oauth_common::{build_url, context, encode_client_credentials, param, random_string, render};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
+use tower_http::set_header::SetResponseHeaderLayer;
 
 // authorization server information
 struct AuthServer {
@@ -51,18 +60,84 @@ const WORDS_API: &str = "http://localhost:9002/words";
 const PRODUCE_API: &str = "http://localhost:9002/produce";
 const FAVORITES_API: &str = "http://localhost:9002/favorites";
 
-/// The JS keeps these in global variables (`var state = null;` etc.).
-/// Here they live in one struct behind a lock that every handler can reach
-/// through `State(app)`. `Option<String>` plays the role of "string or null".
+/// What the client knows about one browser. The JS keeps these in global
+/// variables (`var state = null;` etc.), which mixes everyone up; here each
+/// browser has its own. `Option<String>` plays the role of "string or null".
 #[derive(Default)]
 struct ClientState {
+    /// The `state` of the login this browser has in progress, if any.
     state: Option<String>,
     access_token: Option<String>,
     scope: Option<String>,
     refresh_token: Option<String>,
 }
 
-type AppState = Arc<Mutex<ClientState>>;
+/// One browser's state. Its own lock, so a slow request for one browser
+/// doesn't hold up the others.
+type Session = Arc<Mutex<ClientState>>;
+
+/// Every browser's session, by the id in its `session` cookie. The map's
+/// lock is only held to look a session up, never across an `.await`.
+#[derive(Clone, Default)]
+struct AppState {
+    sessions: Arc<StdMutex<HashMap<String, Session>>>,
+}
+
+const SESSION_COOKIE: &str = "session";
+
+// ---------------------------------------------------------------------------
+// Sessions
+// ---------------------------------------------------------------------------
+
+/// Middleware: finds this browser's session (or starts one), hands it to the
+/// handler as `Extension<Session>`, and sets the cookie on a new session.
+async fn with_session(State(app): State<AppState>, mut req: Request, next: Next) -> Response {
+    let (id, session, is_new) = {
+        let mut sessions = app.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        // Only ids we handed out count. Adopting one the browser made up
+        // would let an attacker plant a session id they know.
+        let known = cookie(req.headers(), SESSION_COOKIE).and_then(|id| sessions.get(&id).map(|s| (id, s.clone())));
+        match known {
+            Some((id, session)) => (id, session, false),
+            None => {
+                let id = random_string(32);
+                let session = Session::default();
+                sessions.insert(id.clone(), session.clone());
+                (id, session, true)
+            }
+        }
+    };
+
+    req.extensions_mut().insert(session);
+    let mut res = next.run(req).await;
+
+    if is_new {
+        // Lax, not Strict: the authorization server sends the browser back to
+        // /callback from another site, and the cookie has to come along.
+        let cookie = format!("{SESSION_COOKIE}={id}; Path=/; HttpOnly; SameSite=Lax");
+        res.headers_mut().append(SET_COOKIE, HeaderValue::from_str(&cookie).expect("cookie is ASCII"));
+    }
+    res
+}
+
+/// The value of one cookie from the request's `Cookie` headers.
+fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get_all(COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(|pair| pair.trim().split_once('='))
+        .find(|(key, _)| *key == name)
+        .map(|(_, value)| value.to_string())
+}
+
+/// The error page, with status 400.
+fn error_page(error: &str) -> Response {
+    let mut page = render("error", context! { error => error });
+    *page.status_mut() = StatusCode::BAD_REQUEST;
+    page
+}
 
 /// The home page, showing the tokens we currently hold.
 fn show_tokens(s: &ClientState) -> Response {
@@ -72,12 +147,12 @@ fn show_tokens(s: &ClientState) -> Response {
     )
 }
 
-async fn index(State(app): State<AppState>) -> Response {
-    show_tokens(&*app.lock().await)
+async fn index(Extension(session): Extension<Session>) -> Response {
+    show_tokens(&*session.lock().await)
 }
 
-async fn authorize(State(app): State<AppState>) -> Response {
-    let mut s = app.lock().await;
+async fn authorize(Extension(session): Extension<Session>) -> Response {
+    let mut s = session.lock().await;
     s.access_token = None;
     s.scope = None;
 
@@ -100,19 +175,21 @@ async fn authorize(State(app): State<AppState>) -> Response {
 }
 
 async fn callback(
-    State(app): State<AppState>,
+    Extension(session): Extension<Session>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    if let Some(error) = params.get("error") {
-        // it's an error response, act accordingly
-        return render("error", context! { error => error });
+    let mut s = session.lock().await;
+
+    // A state is good for one callback, whatever happens next.
+    let expected_state = s.state.take();
+    if expected_state.is_none() || params.get("state") != expected_state.as_ref() {
+        println!("State DOES NOT MATCH: expected {expected_state:?} got {:?}", params.get("state"));
+        return error_page("State value did not match");
     }
 
-    let mut s = app.lock().await;
-
-    if params.get("state") != s.state.as_ref() {
-        println!("State DOES NOT MATCH: expected {:?} got {:?}", s.state, params.get("state"));
-        return render("error", context! { error => "State value did not match" });
+    if let Some(error) = params.get("error") {
+        // it's an error response, act accordingly
+        return error_page(error);
     }
 
     let code = params.get("code").map(String::as_str).unwrap_or("");
@@ -137,18 +214,14 @@ async fn callback(
     // Unlike JS, Rust makes us handle "the server didn't answer at all".
     let tok_res = match tok_res {
         Ok(res) => res,
-        Err(err) => {
-            return render("error", context! { error => format!("Token request failed: {err}") });
-        }
+        Err(err) => return error_page(&format!("Token request failed: {err}")),
     };
 
     if !tok_res.status().is_success() {
-        return render(
-            "error",
-            context! {
-                error => format!("Unable to fetch access token, server response: {}", tok_res.status().as_u16())
-            },
-        );
+        return error_page(&format!(
+            "Unable to fetch access token, server response: {}",
+            tok_res.status().as_u16()
+        ));
     }
 
     let body: Value = tok_res.json().await.unwrap_or_default();
@@ -164,11 +237,12 @@ async fn callback(
     s.scope = body["scope"].as_str().map(String::from);
     println!("Got scope: {:?}", s.scope);
 
-    show_tokens(&s)
+    // Send the browser on, so the code leaves the address bar and the history.
+    Redirect::to("/").into_response()
 }
 
-async fn fetch_resource(State(app): State<AppState>) -> Response {
-    let mut s = app.lock().await;
+async fn fetch_resource(Extension(session): Extension<Session>) -> Response {
+    let mut s = session.lock().await;
 
     let Some(access_token) = s.access_token.clone() else {
         return render("error", context! { error => "Missing Access Token" });
@@ -263,8 +337,8 @@ async fn words() -> Response {
     words_page("", 0, "")
 }
 
-async fn get_words(State(app): State<AppState>) -> Response {
-    let s = app.lock().await;
+async fn get_words(Extension(session): Extension<Session>) -> Response {
+    let s = session.lock().await;
     let res = reqwest::Client::new()
         .get(WORDS_API)
         .header("Authorization", bearer(&s))
@@ -282,10 +356,10 @@ async fn get_words(State(app): State<AppState>) -> Response {
 }
 
 async fn add_word(
-    State(app): State<AppState>,
+    Extension(session): Extension<Session>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    let s = app.lock().await;
+    let s = session.lock().await;
     let res = reqwest::Client::new()
         .post(WORDS_API)
         .header("Authorization", bearer(&s))
@@ -297,8 +371,8 @@ async fn add_word(
     words_page("", 0, if worked { "add" } else { "noadd" })
 }
 
-async fn delete_word(State(app): State<AppState>) -> Response {
-    let s = app.lock().await;
+async fn delete_word(Extension(session): Extension<Session>) -> Response {
+    let s = session.lock().await;
     let res = reqwest::Client::new()
         .delete(WORDS_API)
         .header("Authorization", bearer(&s))
@@ -313,8 +387,8 @@ async fn delete_word(State(app): State<AppState>) -> Response {
 // Produce API (chapter 4)
 // ---------------------------------------------------------------------------
 
-async fn produce(State(app): State<AppState>) -> Response {
-    let s = app.lock().await;
+async fn produce(Extension(session): Extension<Session>) -> Response {
+    let s = session.lock().await;
     let res = reqwest::Client::new()
         .get(PRODUCE_API)
         .header("Authorization", bearer(&s))
@@ -332,8 +406,8 @@ async fn produce(State(app): State<AppState>) -> Response {
 // Favorites API (chapter 4)
 // ---------------------------------------------------------------------------
 
-async fn favorites(State(app): State<AppState>) -> Response {
-    let s = app.lock().await;
+async fn favorites(Extension(session): Extension<Session>) -> Response {
+    let s = session.lock().await;
     let res = reqwest::Client::new()
         .get(FAVORITES_API)
         .header("Authorization", bearer(&s))
@@ -362,6 +436,7 @@ async fn implicit() -> Response {
 async fn main() {
     oauth_common::set_views_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/templates"));
 
+    let state = AppState::default();
     let app = Router::new()
         .route("/", get(index))
         .route("/authorize", get(authorize))
@@ -374,7 +449,10 @@ async fn main() {
         .route("/produce", get(produce))
         .route("/favorites", get(favorites))
         .route("/implicit", get(implicit))
-        .with_state(AppState::default());
+        .layer(middleware::from_fn_with_state(state.clone(), with_session))
+        // Keep codes and tokens in URLs out of the Referer header (RFC 9700 §4.2).
+        .layer(SetResponseHeaderLayer::overriding(REFERRER_POLICY, HeaderValue::from_static("no-referrer")))
+        .with_state(state);
 
     oauth_common::serve(app, 9000, "OAuth Client").await;
 }
