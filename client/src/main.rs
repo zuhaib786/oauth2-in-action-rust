@@ -21,7 +21,7 @@ use axum::{
     },
     middleware::{self, Next},
     response::{IntoResponse, Redirect, Response},
-    routing::get,
+    routing::{get, post},
 };
 use oauth_common::{build_url, context, encode_client_credentials, param, pkce_challenge, random_string, render};
 use serde_json::{Value, json};
@@ -32,11 +32,13 @@ use tower_http::set_header::SetResponseHeaderLayer;
 struct AuthServer {
     authorization_endpoint: &'static str,
     token_endpoint: &'static str,
+    revocation_endpoint: &'static str,
 }
 
 const AUTH_SERVER: AuthServer = AuthServer {
     authorization_endpoint: "http://localhost:9001/authorize",
     token_endpoint: "http://localhost:9001/token",
+    revocation_endpoint: "http://localhost:9001/revoke",
 };
 
 // client information
@@ -288,6 +290,31 @@ async fn fetch_resource(Extension(session): Extension<Session>) -> Response {
 
 /// Trades our refresh token for a new access token, then sends the browser
 /// back to /fetch_resource to try again.
+/// Tells the authorization server we're done with our tokens (RFC 7009), then
+/// forgets them.
+async fn revoke(Extension(session): Extension<Session>) -> Response {
+    let mut s = session.lock().await;
+    // the refresh token first: it takes its whole grant with it
+    for token in [s.refresh_token.take(), s.access_token.take()].into_iter().flatten() {
+        let answer = reqwest::Client::new()
+            .post(AUTH_SERVER.revocation_endpoint)
+            .header(
+                "Authorization",
+                format!("Basic {}", encode_client_credentials(CLIENT.client_id, CLIENT.client_secret)),
+            )
+            .form(&[("token", token.as_str())])
+            .send()
+            .await;
+        match answer {
+            Ok(res) if res.status().is_success() => println!("Revoked token {token}"),
+            Ok(res) => println!("Couldn't revoke token {token}: {}", res.status()),
+            Err(err) => println!("Couldn't revoke token {token}: {err}"),
+        }
+    }
+    s.scope = None;
+    Redirect::to("/").into_response()
+}
+
 async fn refresh_access_token(s: &mut ClientState) -> Response {
     let refresh_token = s.refresh_token.clone().unwrap_or_default();
     println!("Refreshing token {refresh_token}");
@@ -453,6 +480,7 @@ async fn main() {
         .route("/authorize", get(authorize))
         .route("/callback", get(callback))
         .route("/fetch_resource", get(fetch_resource))
+        .route("/revoke", post(revoke))
         .route("/words", get(words))
         .route("/get_words", get(get_words))
         .route("/add_word", get(add_word))

@@ -702,16 +702,10 @@ async fn approve(
 
 /// The token endpoint. The client calls this directly (not through the
 /// browser) to trade a grant, like an authorization code, for an access token.
-async fn token(
-    State(app): State<AppState>,
-    headers: HeaderMap,
-    Form(pairs): Form<Vec<(String, String)>>,
-) -> Response {
-    let Some(body) = single_valued(pairs) else {
-        return json_error(StatusCode::BAD_REQUEST, "invalid_request");
-    };
-
-    // --- Who is calling? Authenticate the client. ---
+/// Works out which client is calling `/token` or `/revoke`: Basic auth or
+/// form parameters for confidential clients, `client_id` alone for public
+/// ones (RFC 6749 §2.3). `None` means it failed: answer 401 `invalid_client`.
+fn authenticate_client(headers: &HeaderMap, body: &HashMap<String, String>) -> Option<&'static Client> {
     let mut client_id = None;
     let mut client_secret = None;
 
@@ -727,7 +721,7 @@ async fn token(
         if client_id.is_some() {
             // if we've already seen the client's credentials in the authorization header, this is an error
             println!("Client attempted to authenticate with multiple methods");
-            return json_error(StatusCode::UNAUTHORIZED, "invalid_client");
+            return None;
         }
         client_id = Some(id.clone());
         client_secret = body.get("client_secret").cloned();
@@ -736,7 +730,7 @@ async fn token(
     let client_id = client_id.unwrap_or_default();
     let Some(client) = get_client(&client_id) else {
         println!("Unknown client {client_id}");
-        return json_error(StatusCode::UNAUTHORIZED, "invalid_client");
+        return None;
     };
 
     let authenticated = match (&client.client_secret, &client_secret) {
@@ -748,8 +742,24 @@ async fn token(
     };
     if !authenticated {
         println!("Client {client_id} failed to authenticate");
-        return json_error(StatusCode::UNAUTHORIZED, "invalid_client");
+        return None;
     }
+    Some(client)
+}
+
+async fn token(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Form(pairs): Form<Vec<(String, String)>>,
+) -> Response {
+    let Some(body) = single_valued(pairs) else {
+        return json_error(StatusCode::BAD_REQUEST, "invalid_request");
+    };
+
+    let Some(client) = authenticate_client(&headers, &body) else {
+        return json_error(StatusCode::UNAUTHORIZED, "invalid_client");
+    };
+    let client_id = &client.client_id;
 
     // --- Which grant type is the client using, and may it? ---
     let grant_type = param(&body, "grant_type");
@@ -889,6 +899,47 @@ async fn introspect(
     Json(answer).into_response()
 }
 
+/// `POST /revoke` (RFC 7009): a client is done with one of its tokens.
+async fn revoke(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Form(pairs): Form<Vec<(String, String)>>,
+) -> Response {
+    let Some(body) = single_valued(pairs) else {
+        return json_error(StatusCode::BAD_REQUEST, "invalid_request");
+    };
+    let Some(client) = authenticate_client(&headers, &body) else {
+        return json_error(StatusCode::UNAUTHORIZED, "invalid_client");
+    };
+
+    // token_type_hint only says where to look first, and we look everywhere
+    let token = param(&body, "token");
+    let record = app.db.find_one(|doc| doc["refresh_token"] == token).or_else(|| {
+        let claims = verify_access_token(token)?;
+        let jti = claims.get("jti")?;
+        app.db.find_one(|doc| doc["jti"] == *jti)
+    });
+
+    // Nothing to do isn't an error: the client wanted the token gone, and it is.
+    let Some(record) = record else {
+        println!("Client {} revoked a token we don't know", client.client_id);
+        return StatusCode::OK.into_response();
+    };
+    if record["client_id"] != client.client_id.as_str() {
+        println!("Client {} tried to revoke a token of {}", client.client_id, record["client_id"]);
+        return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
+    }
+
+    if record.get("refresh_token").is_some() {
+        // a refresh token takes its whole grant with it (RFC 7009 §2.1)
+        revoke_grant(&app.db, record["grant_id"].as_str().unwrap_or_default());
+    } else {
+        app.db.remove(|doc| doc["jti"] == record["jti"]);
+        println!("Revoked access token {}", record["jti"]);
+    }
+    StatusCode::OK.into_response()
+}
+
 fn requested_scope(client: &Client, body: &HashMap<String, String>) -> Option<Vec<String>> {
     let cscope = split_scope(&client.scope);
     match body.get("scope") {
@@ -918,16 +969,32 @@ fn refresh_token_grant(app: &AppState, client: &Client, body: &HashMap<String, S
         return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
     }
 
-    // The new access token joins the refresh token's grant.
+    // Rotation: this refresh token is now used up. If it already was, two
+    // parties hold it and one of them stole it. We can't tell which, so the
+    // whole grant goes (RFC 9700 §4.14.2). One update, under the database's
+    // lock, so two racing requests can't both win.
+    let grant_id = token["grant_id"].as_str().unwrap_or_default();
+    let first_use = app.db.update(
+        |doc| doc["refresh_token"] == refresh_token && doc["used"] != true,
+        |doc| doc["used"] = json!(true),
+    );
+    if first_use == 0 {
+        println!("Refresh token {refresh_token} was used before: revoking its grant");
+        revoke_grant(&app.db, grant_id);
+        return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
+    }
+
+    // The new tokens join the refresh token's grant.
     let grant = Grant {
-        id: token["grant_id"].as_str().unwrap_or_default().to_string(),
+        id: grant_id.to_string(),
         client,
         scope: serde_json::from_value(token["scope"].clone()).unwrap_or_default(),
         user: token["user"].as_str().map(String::from),
     };
     let access_token = grant.issue_access_token(&app.db);
-    println!("for refresh token {refresh_token}");
-    token_response(&access_token, Some(refresh_token), &grant.scope)
+    let new_refresh_token = grant.issue_refresh_token(&app.db);
+    println!("in exchange for refresh token {refresh_token}");
+    token_response(&access_token, Some(&new_refresh_token), &grant.scope)
 }
 
 /// grant_type=client_credentials: the client gets a token for itself. No
@@ -1006,6 +1073,7 @@ async fn main() {
     let token_endpoint = Router::new()
         .route("/token", post(token))
         .route("/introspect", post(introspect))
+        .route("/revoke", post(revoke))
         .layer(set_header(CACHE_CONTROL, "no-store"))
         .layer(set_header(PRAGMA, "no-cache"));
 
