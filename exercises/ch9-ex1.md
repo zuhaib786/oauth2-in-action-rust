@@ -47,6 +47,9 @@ token that came from its first use stops working: the access and refresh tokens
 it produced, and any access token obtained since with that refresh token. The
 protected resource refuses those access tokens (401). The refresh token gets
 `invalid_grant`. Tokens from other codes are unaffected.
+(From 11-1 on, access tokens are self-contained, and the protected resource
+can't hear about revocation until 11-4. So on `main` the R3 tests check only
+the refresh tokens.)
 
 **R4.** Authorization codes, and the `reqid` on the approval page, carry at
 least 128 bits of randomness (22 or more characters, in the tests' terms).

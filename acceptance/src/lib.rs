@@ -272,6 +272,42 @@ pub fn pkce_pair() -> (String, String) {
     (verifier, challenge)
 }
 
+// ---------------------------------------------------------------------------
+// JWTs (chapter 11)
+// ---------------------------------------------------------------------------
+
+/// Seconds since 1970, the unit JWT times use.
+pub fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// The header and claims of a JWT, decoded but **not** verified.
+#[track_caller]
+pub fn jwt_parts(token: &str) -> (Value, Value) {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    let parts: Vec<&str> = token.split('.').collect();
+    assert_eq!(parts.len(), 3, "a JWT has three parts separated by dots, got {token:?}");
+    let decode = |part: &str, what: &str| -> Value {
+        let bytes = URL_SAFE_NO_PAD
+            .decode(part)
+            .unwrap_or_else(|e| panic!("the JWT's {what} isn't base64url without padding ({e}): {part}"));
+        serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("the JWT's {what} isn't JSON ({e})"))
+    };
+    (decode(parts[0], "header"), decode(parts[1], "claims"))
+}
+
+/// An unsigned JWT (`"alg": "none"`) with these claims. Anyone can make one,
+/// which is the whole problem with accepting them.
+pub fn unsigned_jwt(header: &Value, claims: &Value) -> String {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    format!(
+        "{}.{}.",
+        URL_SAFE_NO_PAD.encode(header.to_string()),
+        URL_SAFE_NO_PAD.encode(claims.to_string())
+    )
+}
+
 /// `POST /token` authenticated as oauth-client-1 with HTTP Basic.
 pub fn token_request(form: &[(&str, &str)]) -> Reply {
     token_request_as(CLIENT_ID, CLIENT_SECRET, form)

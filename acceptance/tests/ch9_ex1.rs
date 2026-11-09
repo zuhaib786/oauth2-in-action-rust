@@ -27,46 +27,36 @@ fn r1_the_token_request_must_repeat_the_redirect_uri() {
     redeem(&get_code("foo", "alice"), Some(REDIRECT_URI)).assert_status(200);
 }
 
+// From chapter 11 on, access tokens are self-contained JWTs, and the
+// protected resource can't know that one was revoked until 11-4 adds
+// introspection. So these tests check the refresh tokens here; 11-4's tests
+// check the access tokens.
+
 #[test]
 fn r3_a_replayed_code_kills_the_tokens_it_produced() {
     let code = get_code("foo", "alice");
     let first = redeem(&code, Some(REDIRECT_URI));
     first.assert_status(200);
-    let tokens = first.json();
-    let access = tokens["access_token"].as_str().unwrap();
-    let refresh_token = tokens["refresh_token"].as_str().unwrap();
-    get_resource(access).assert_status(200);
+    let refresh_token = first.json()["refresh_token"].as_str().unwrap().to_string();
 
     let replay = redeem(&code, Some(REDIRECT_URI));
     replay.assert_status(400);
     assert_eq!(error_code(&replay), "invalid_grant");
 
-    get_resource(access).assert_status(401);
-    let refreshed = refresh(refresh_token);
+    let refreshed = refresh(&refresh_token);
     refreshed.assert_status(400);
     assert_eq!(error_code(&refreshed), "invalid_grant", "the refresh token from the replayed code must be dead");
-}
-
-#[test]
-fn r3_tokens_from_refreshing_die_too() {
-    let code = get_code("foo", "alice");
-    let tokens = redeem(&code, Some(REDIRECT_URI)).json();
-    let refreshed = refresh(tokens["refresh_token"].as_str().unwrap()).json();
-    let second_access = refreshed["access_token"].as_str().unwrap();
-    get_resource(second_access).assert_status(200);
-
-    redeem(&code, Some(REDIRECT_URI)).assert_status(400);
-    get_resource(second_access).assert_status(401);
 }
 
 #[test]
 fn r3_other_codes_tokens_survive() {
     let (stolen, innocent) = (get_code("foo", "alice"), get_code("foo", "alice"));
     redeem(&stolen, Some(REDIRECT_URI)).assert_status(200);
-    let innocent_token = redeem(&innocent, Some(REDIRECT_URI)).json()["access_token"].as_str().unwrap().to_string();
+    let innocent_tokens = redeem(&innocent, Some(REDIRECT_URI)).json();
 
     redeem(&stolen, Some(REDIRECT_URI)).assert_status(400);
-    get_resource(&innocent_token).assert_status(200);
+    get_resource(innocent_tokens["access_token"].as_str().unwrap()).assert_status(200);
+    refresh(innocent_tokens["refresh_token"].as_str().unwrap()).assert_status(200);
 }
 
 #[test]
