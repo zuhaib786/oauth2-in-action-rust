@@ -5,7 +5,7 @@
         {% for client in clients %}
         <ul>
           <li><b>client_id:</b> <code>{{ client.client_id }}</code></li>
-          <li><b>client_secret:</b> {% if client.client_secret %}<code>{{ client.client_secret }}</code>{% else %}<i>none (public client)</i>{% endif %}</li>
+          <li><b>token_endpoint_auth_method:</b> <code>{{ client.token_endpoint_auth_method }}</code></li>
           <li><b>scope:</b> <code>{{ client.scope }}</code></li>
           <li><b>redirect_uri:</b> <code>{{ client.redirect_uris | join(", ") }}</code></li>
           <li><b>grant_types:</b> <code>{{ client.grant_types | join(", ") }}</code></li>
