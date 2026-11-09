@@ -17,6 +17,9 @@
 //! | `req.query.x` / `req.body.x`    | [`param`]`(&query, "x")`                |
 //! | `app.listen(port, ...)`         | [`serve`]                               |
 //! | PKCE's S256 (chapter 10)        | [`pkce_challenge`]                      |
+//! | DPoP proofs (chapter 15)        | [`dpop::check_request`]                 |
+
+pub mod dpop;
 
 use std::{
     collections::HashMap,
