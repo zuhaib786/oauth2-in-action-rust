@@ -8,6 +8,7 @@
 
 use std::{
     collections::HashMap,
+    net::{Ipv4Addr, Ipv6Addr},
     sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
@@ -26,6 +27,7 @@ use oauth_common::{
 use serde::Serialize;
 use serde_json::json;
 use tokio::sync::Mutex;
+use url::{Host, Url};
 
 // authorization server information
 const AUTHORIZATION_ENDPOINT: &str = "http://localhost:9001/authorize";
@@ -52,6 +54,37 @@ impl Client {
     fn allows_grant(&self, grant_type: &str) -> bool {
         self.grant_types.iter().any(|g| g == grant_type)
     }
+
+    fn has_redirect_uri(&self, redirect_uri: &str) -> bool {
+        self.redirect_uris.iter().any(|registered| redirect_uri_matches(registered, redirect_uri))
+    }
+}
+
+/// Redirect URIs must match exactly, with one exception: a native app's
+/// loopback redirect URI may use any port, because the app only learns its
+/// port when it starts (RFC 8252 §7.3).
+fn redirect_uri_matches(registered: &str, requested: &str) -> bool {
+    if registered == requested {
+        return true;
+    }
+    let (Ok(registered), Ok(mut requested)) = (Url::parse(registered), Url::parse(requested)) else {
+        return false;
+    };
+    if registered.scheme() != "http" || !is_loopback_ip(&registered) {
+        return false;
+    }
+    // Ignore the port; everything else must be the same.
+    requested.set_port(registered.port()).is_ok() && requested == registered
+}
+
+/// The loopback IP literals. Not `localhost`: a name can resolve elsewhere
+/// (RFC 8252 §8.3).
+fn is_loopback_ip(url: &Url) -> bool {
+    match url.host() {
+        Some(Host::Ipv4(ip)) => ip == Ipv4Addr::LOCALHOST,
+        Some(Host::Ipv6(ip)) => ip == Ipv6Addr::LOCALHOST,
+        _ => false,
+    }
 }
 
 static CLIENTS: LazyLock<Vec<Client>> = LazyLock::new(|| {
@@ -76,6 +109,13 @@ static CLIENTS: LazyLock<Vec<Client>> = LazyLock::new(|| {
             redirect_uris: vec![],
             scope: "read write".into(),
             grant_types: vec!["client_credentials".into()],
+        },
+        Client {
+            client_id: "oauth-native-client".into(),
+            client_secret: None,
+            redirect_uris: vec!["http://127.0.0.1/callback".into()],
+            scope: "foo bar".into(),
+            grant_types: vec!["authorization_code".into(), "refresh_token".into()],
         },
         Client {
             client_id: "oauth-client-trusted".into(),
@@ -351,7 +391,7 @@ async fn authorize(
         return error_page("Unknown client");
     };
 
-    if !client.redirect_uris.iter().any(|uri| uri == redirect_uri) {
+    if !client.has_redirect_uri(redirect_uri) {
         println!("Mismatched redirect URI, expected {:?} got {redirect_uri}", client.redirect_uris);
         return error_page("Invalid redirect URI");
     }
