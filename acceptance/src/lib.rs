@@ -308,6 +308,37 @@ pub fn unsigned_jwt(header: &Value, claims: &Value) -> String {
     )
 }
 
+/// HMAC (RFC 2104) over a hash with this block size.
+fn hmac(block_size: usize, hash: fn(&[u8]) -> Vec<u8>, key: &[u8], message: &[u8]) -> Vec<u8> {
+    let mut key = if key.len() > block_size { hash(key) } else { key.to_vec() };
+    key.resize(block_size, 0);
+    let pad = |byte: u8| key.iter().map(|k| k ^ byte).collect::<Vec<u8>>();
+    let inner = hash(&[pad(0x36), message.to_vec()].concat());
+    hash(&[pad(0x5c), inner].concat())
+}
+
+/// The base64url signature that `alg` (`HS256` or `HS512`) makes over
+/// `signing_input` (the first two parts of a JWT, with their dot).
+pub fn hs_signature(alg: &str, secret: &[u8], signing_input: &str) -> String {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use sha2::{Digest, Sha256, Sha512};
+
+    let signature = match alg {
+        "HS256" => hmac(64, |m| Sha256::digest(m).to_vec(), secret, signing_input.as_bytes()),
+        "HS512" => hmac(128, |m| Sha512::digest(m).to_vec(), secret, signing_input.as_bytes()),
+        other => panic!("the tests can't sign with {other}"),
+    };
+    URL_SAFE_NO_PAD.encode(signature)
+}
+
+/// A JWT signed with a shared secret, using the `alg` its header names.
+pub fn hs_jwt(header: &Value, claims: &Value, secret: &[u8]) -> String {
+    let unsigned = unsigned_jwt(header, claims);
+    let signing_input = unsigned.trim_end_matches('.');
+    let alg = header["alg"].as_str().expect("the header needs an alg");
+    format!("{signing_input}.{}", hs_signature(alg, secret, signing_input))
+}
+
 /// `POST /token` authenticated as oauth-client-1 with HTTP Basic.
 pub fn token_request(form: &[(&str, &str)]) -> Reply {
     token_request_as(CLIENT_ID, CLIENT_SECRET, form)

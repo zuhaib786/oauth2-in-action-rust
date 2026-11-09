@@ -176,27 +176,5 @@ fn r5_scope_and_user_come_from_the_token() {
     assert_eq!(favorites.json()["user"], "Bob");
 }
 
-// The hole that 11-2 closes. 11-2 replaces this test.
-#[test]
-fn r6_anyone_can_mint_a_token() {
-    let now = now_secs();
-    let forged = unsigned_jwt(
-        &json!({ "alg": "none", "typ": "at+jwt" }),
-        &json!({
-            "iss": issuer(),
-            "aud": [audience(), "http://localhost:9999/"],
-            "sub": BOB_SUB,
-            "client_id": "a-client-nobody-registered",
-            "scope": "read",
-            "iat": now,
-            "exp": now + 60,
-            "jti": unique("forged"),
-        }),
-    );
-
-    let favorites = http().get(format!("{RS_URL}/favorites")).bearer_auth(&forged).call();
-    favorites.assert_status(200);
-    assert_eq!(favorites.json()["user"], "Bob", "the resource should believe the claims (for now)");
-    http().get(format!("{RS_URL}/words")).bearer_auth(&forged).call().assert_status(200);
-    http().post(format!("{RS_URL}/words")).bearer_auth(&forged).form(&[("word", "x")]).call().assert_status(403);
-}
+// r6_anyone_can_mint_a_token lived here. 11-2 turned it around: see
+// r2_unsigned_tokens_are_refused in ch11_ex2.rs.
