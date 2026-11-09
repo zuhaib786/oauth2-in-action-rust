@@ -1,0 +1,11 @@
+[package]
+name = "acceptance"
+version = "0.1.0"
+edition = "2024"
+description = "Black-box tests that talk to the three running servers over HTTP"
+publish = false
+
+[dependencies]
+reqwest = { workspace = true, features = ["blocking", "cookies"] }
+serde_json.workspace = true
+url.workspace = true

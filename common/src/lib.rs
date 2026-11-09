@@ -22,7 +22,7 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{Mutex, MutexGuard, OnceLock},
 };
 
 use axum::{
@@ -204,6 +204,10 @@ pub fn render(name: &str, ctx: minijinja::Value) -> Response {
 /// They share tokens by opening the same file, just like the Node versions
 /// share `database.nosql`.
 ///
+/// Safe to use from many requests at once: changes inside one program take
+/// turns, and a rewrite replaces the file in one step, so the other program
+/// never reads a half-written file.
+///
 /// ```ignore
 /// let db = Db::shared();
 /// db.insert(json!({ "access_token": token, "client_id": id }));
@@ -228,17 +232,40 @@ impl Db {
 
     /// Deletes every document (`nosql.clear()`).
     pub fn clear(&self) {
+        let _turn = writer_turn();
         self.write_all(&[]);
     }
 
     /// Adds a document (`nosql.insert({...})`).
     pub fn insert(&self, doc: Value) {
+        let _turn = writer_turn();
         let mut file = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)
             .unwrap_or_else(|e| panic!("cannot open {}: {e}", self.path.display()));
-        writeln!(file, "{doc}").expect("failed to write to database file");
+        // One write call for the whole line, so lines never interleave.
+        file.write_all(format!("{doc}\n").as_bytes()).expect("failed to write to database file");
+    }
+
+    /// Changes every document for which `matches` returns true and returns
+    /// how many were changed.
+    ///
+    /// ```ignore
+    /// db.update(|doc| doc["refresh_token"] == token, |doc| doc["revoked"] = json!(true));
+    /// ```
+    pub fn update(&self, matches: impl Fn(&Value) -> bool, mut change: impl FnMut(&mut Value)) -> usize {
+        let _turn = writer_turn();
+        let mut docs = self.read_all();
+        let mut changed = 0;
+        for doc in docs.iter_mut().filter(|doc| matches(doc)) {
+            change(doc);
+            changed += 1;
+        }
+        if changed > 0 {
+            self.write_all(&docs);
+        }
+        changed
     }
 
     /// The first document for which `matches` returns true (`nosql.one()`).
@@ -254,6 +281,7 @@ impl Db {
     /// Deletes every document for which `matches` returns true and returns how
     /// many were deleted (`nosql.remove()`).
     pub fn remove(&self, matches: impl Fn(&Value) -> bool) -> usize {
+        let _turn = writer_turn();
         let docs = self.read_all();
         let before = docs.len();
         let kept: Vec<Value> = docs.into_iter().filter(|doc| !matches(doc)).collect();
@@ -274,11 +302,21 @@ impl Db {
             .collect()
     }
 
+    /// Writes a new file next to the old one, then renames it over the old
+    /// one, so readers see either the old contents or the new, never half.
     fn write_all(&self, docs: &[Value]) {
         let text: String = docs.iter().map(|doc| format!("{doc}\n")).collect();
-        fs::write(&self.path, text)
-            .unwrap_or_else(|e| panic!("cannot write {}: {e}", self.path.display()));
+        let tmp = self.path.with_extension(format!("tmp-{}", random_string(8)));
+        fs::write(&tmp, text).unwrap_or_else(|e| panic!("cannot write {}: {e}", tmp.display()));
+        fs::rename(&tmp, &self.path)
+            .unwrap_or_else(|e| panic!("cannot replace {}: {e}", self.path.display()));
     }
+}
+
+/// Changes to the database file take turns within this program.
+fn writer_turn() -> MutexGuard<'static, ()> {
+    static WRITER: Mutex<()> = Mutex::new(());
+    WRITER.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 // ---------------------------------------------------------------------------
@@ -336,6 +374,8 @@ mod tests {
         assert_eq!(db.remove(|d| d["client_id"] == "c1"), 1);
         assert!(db.find_one(|d| d["access_token"] == "a").is_none());
         assert_eq!(db.find_all(|_| true).len(), 1);
+        assert_eq!(db.update(|d| d["client_id"] == "c2", |d| d["revoked"] = true.into()), 1);
+        assert_eq!(db.find_one(|d| d["access_token"] == "b").unwrap()["revoked"], true);
         let _ = fs::remove_file(path);
     }
 }
