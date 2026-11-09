@@ -137,27 +137,7 @@ fn r4_the_client_can_revoke() {
     assert_dead_access_token(&access_token, "the client revoked it");
 }
 
-#[test]
-fn r5_the_client_keeps_the_rotated_refresh_token() {
-    let _turn = client_app_lock();
-    let bob = browser();
-    client_login(&bob, "bob", None).assert_status(303);
-
-    for round in 1..=2 {
-        let old = client_shown_token(&bob).expect("the client should hold a token");
-        revoke(&old).assert_status(200);
-
-        // the resource refuses the token, so the client refreshes and tries again
-        let mut reply = bob.get(format!("{CLIENT_URL}/fetch_resource")).call();
-        for _ in 0..3 {
-            if !reply.is_redirect() {
-                break;
-            }
-            reply = bob.get(format!("{CLIENT_URL}{}", reply.location())).call();
-        }
-        reply.assert_status(200);
-        assert!(reply.body.contains("This data has been protected by OAuth 2.0"), "round {round}: {}", reply.body);
-        let new = client_shown_token(&bob).expect("the client should hold a token");
-        assert_ne!(new, old, "round {round}: the client should have refreshed");
-    }
-}
+// r5_the_client_keeps_the_rotated_refresh_token lived here. From 12-1 on, the
+// web client has its own registration, so a test can't revoke its tokens for
+// it. r8 in ch12_ex1.rs checks the same thing through the client's Refresh
+// button.
