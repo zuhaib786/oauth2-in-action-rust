@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+    <img src="assets/logo-light.svg" alt="OAuth 2 in Action, Rust edition" width="520">
+  </picture>
+</p>
+
 # OAuth 2 in Action — Rust edition
 
 The exercises from [*OAuth 2 in Action*](https://github.com/oauthinaction/oauth-in-action-code)
@@ -8,6 +15,16 @@ The book gives every exercise its own separate copy of the code. Here there is
 just one client, one protected resource and one authorization server. Each
 exercise adds its feature to the same code, so by the end you have a single
 authorization server with everything the book teaches.
+
+## Getting the code
+
+```sh
+git clone https://github.com/zuhaib786/oauth2-in-action-rust.git
+cd oauth2-in-action-rust
+git tag        # the exercise tags come with the clone
+```
+
+You need Rust 1.85 or newer (install it from [rustup.rs](https://rustup.rs)).
 
 ## Running it
 
@@ -49,19 +66,31 @@ git switch -c my-ch3-ex2 ch3-ex2-start
 Each exercise starts from the official solution of the one before. If your
 version came out different, that's fine: your branch still has it.
 
-| Book exercise | Tag prefix | What you write | File |
-|---|---|---|---|
-| 3-1 | `ch3-ex1` | Client: get a token with the authorization code grant, use it | `client/src/main.rs` |
-| 3-2 | `ch3-ex2` | Client: use a refresh token when the access token stops working | `client/src/main.rs` |
-| 4-1 | `ch4-ex1` | Protected resource: find and check the incoming token | `protected-resource/src/main.rs` |
-| 4-2 | `ch4-ex2` | Protected resource: require `read`/`write`/`delete` scopes | `protected-resource/src/main.rs` |
-| 4-3 | `ch4-ex3` | Protected resource: return different data depending on scope | `protected-resource/src/main.rs` |
-| 4-4 | `ch4-ex4` | Protected resource: return different data depending on the user | `protected-resource/src/main.rs` |
-| 5-1 | `ch5-ex1` | Authorization server: `/authorize`, `/approve` and `/token` | `authorization-server/src/main.rs` |
-| 5-2 | `ch5-ex2` | Authorization server: issue and accept refresh tokens | `authorization-server/src/main.rs` |
-| 5-3 | `ch5-ex3` | Authorization server: scopes | `authorization-server/src/main.rs` |
+| Book exercise | Tag prefix | What you write | File | Browse |
+|---|---|---|---|---|
+| 3-1 | `ch3-ex1` | Client: get a token with the authorization code grant, use it | `client/src/main.rs` | [start](https://github.com/zuhaib786/oauth2-in-action-rust/tree/ch3-ex1-start) · [solution](https://github.com/zuhaib786/oauth2-in-action-rust/compare/ch3-ex1-start...ch3-ex1-done) |
+| 3-2 | `ch3-ex2` | Client: use a refresh token when the access token stops working | `client/src/main.rs` | [start](https://github.com/zuhaib786/oauth2-in-action-rust/tree/ch3-ex2-start) · [solution](https://github.com/zuhaib786/oauth2-in-action-rust/compare/ch3-ex2-start...ch3-ex2-done) |
+| 4-1 | `ch4-ex1` | Protected resource: find and check the incoming token | `protected-resource/src/main.rs` | [start](https://github.com/zuhaib786/oauth2-in-action-rust/tree/ch4-ex1-start) · [solution](https://github.com/zuhaib786/oauth2-in-action-rust/compare/ch4-ex1-start...ch4-ex1-done) |
+| 4-2 | `ch4-ex2` | Protected resource: require `read`/`write`/`delete` scopes | `protected-resource/src/main.rs` | [start](https://github.com/zuhaib786/oauth2-in-action-rust/tree/ch4-ex2-start) · [solution](https://github.com/zuhaib786/oauth2-in-action-rust/compare/ch4-ex2-start...ch4-ex2-done) |
+| 4-3 | `ch4-ex3` | Protected resource: return different data depending on scope | `protected-resource/src/main.rs` | [start](https://github.com/zuhaib786/oauth2-in-action-rust/tree/ch4-ex3-start) · [solution](https://github.com/zuhaib786/oauth2-in-action-rust/compare/ch4-ex3-start...ch4-ex3-done) |
+| 4-4 | `ch4-ex4` | Protected resource: return different data depending on the user | `protected-resource/src/main.rs` | [start](https://github.com/zuhaib786/oauth2-in-action-rust/tree/ch4-ex4-start) · [solution](https://github.com/zuhaib786/oauth2-in-action-rust/compare/ch4-ex4-start...ch4-ex4-done) |
+| 5-1 | `ch5-ex1` | Authorization server: `/authorize`, `/approve` and `/token` | `authorization-server/src/main.rs` | [start](https://github.com/zuhaib786/oauth2-in-action-rust/tree/ch5-ex1-start) · [solution](https://github.com/zuhaib786/oauth2-in-action-rust/compare/ch5-ex1-start...ch5-ex1-done) |
+| 5-2 | `ch5-ex2` | Authorization server: issue and accept refresh tokens | `authorization-server/src/main.rs` | [start](https://github.com/zuhaib786/oauth2-in-action-rust/tree/ch5-ex2-start) · [solution](https://github.com/zuhaib786/oauth2-in-action-rust/compare/ch5-ex2-start...ch5-ex2-done) |
+| 5-3 | `ch5-ex3` | Authorization server: scopes | `authorization-server/src/main.rs` | [start](https://github.com/zuhaib786/oauth2-in-action-rust/tree/ch5-ex3-start) · [solution](https://github.com/zuhaib786/oauth2-in-action-rust/compare/ch5-ex3-start...ch5-ex3-done) |
+
+"solution" opens GitHub's diff view, so you see exactly what the exercise
+changes and nothing else. Don't open it before you've tried!
 
 Later chapters will be added the same way.
+
+### One reader's solutions
+
+The `solutions/zuhaib/*` branches hold the author's own attempts, written while
+working through the exercises. Each one starts from the exercise's `start` tag,
+so its diff is just that answer. For example,
+[this 3-1](https://github.com/zuhaib786/oauth2-in-action-rust/compare/ch3-ex1-start...solutions/zuhaib/ch3-ex1)
+vs [the reference 3-1](https://github.com/zuhaib786/oauth2-in-action-rust/compare/ch3-ex1-start...ch3-ex1-done).
+Some of them use let chains (`if let ... && let ...`), which need Rust 1.88.
 
 ## Layout
 
@@ -111,3 +140,11 @@ database.jsonl          tokens issued by the authorization server and read by th
   `.to_string()` or `String::from(...)` turns a `&str` into a `String`.
   `&my_string` or `.as_str()` goes the other way.
 - The compiler's error messages are long but usually tell you exactly what to change. Read them.
+
+## License
+
+[Apache License 2.0](LICENSE), the same license as the book's code. This is a
+port of the exercises from
+[oauthinaction/oauth-in-action-code](https://github.com/oauthinaction/oauth-in-action-code)
+by Justin Richer and Antonio Sanso. The HTML templates and the exercise
+structure are adapted from that code. See [NOTICE](NOTICE).
