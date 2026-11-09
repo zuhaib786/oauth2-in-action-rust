@@ -348,6 +348,16 @@ async fn favorites(State(app): State<AppState>) -> Response {
     render("favorites", context! { scope => s.scope, data => data })
 }
 
+// ---------------------------------------------------------------------------
+// Browser-only client (chapter 6)
+// ---------------------------------------------------------------------------
+
+/// A client that lives entirely in the browser. This only serves the page:
+/// the JavaScript in it does the OAuth work.
+async fn implicit() -> Response {
+    render("implicit", context! {})
+}
+
 #[tokio::main]
 async fn main() {
     oauth_common::set_views_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/templates"));
@@ -363,6 +373,7 @@ async fn main() {
         .route("/delete_word", get(delete_word))
         .route("/produce", get(produce))
         .route("/favorites", get(favorites))
+        .route("/implicit", get(implicit))
         .with_state(AppState::default());
 
     oauth_common::serve(app, 9000, "OAuth Client").await;
