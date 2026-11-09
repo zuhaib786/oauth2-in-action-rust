@@ -124,6 +124,7 @@ outside (how you store passwords, say). The spec marks those "not tested".
 | 8-1 | `ch8-ex1` | Protected resource: fix an XSS, proper `WWW-Authenticate` challenges, no tokens in URLs | [spec](exercises/ch8-ex1.md) | [start](https://github.com/zuhaib786/oauth2-in-action-rust/tree/ch8-ex1-start) · [solution](https://github.com/zuhaib786/oauth2-in-action-rust/compare/ch8-ex1-start...ch8-ex1-done) |
 | 8-2 | `ch8-ex2` | Protected resource: CORS for one origin, not for everyone | [spec](exercises/ch8-ex2.md) | [start](https://github.com/zuhaib786/oauth2-in-action-rust/tree/ch8-ex2-start) · [solution](https://github.com/zuhaib786/oauth2-in-action-rust/compare/ch8-ex2-start...ch8-ex2-done) |
 | 8-3 | `ch8-ex3` | Both servers: HSTS, `no-store` on token responses, anti-clickjacking, referrer policy | [spec](exercises/ch8-ex3.md) | [start](https://github.com/zuhaib786/oauth2-in-action-rust/tree/ch8-ex3-start) · [solution](https://github.com/zuhaib786/oauth2-in-action-rust/compare/ch8-ex3-start...ch8-ex3-done) |
+| 9-1 | `ch9-ex1` | Authorization server: `redirect_uri` checked at the token endpoint, code replay revokes tokens, unguessable codes | [spec](exercises/ch9-ex1.md) | [start](https://github.com/zuhaib786/oauth2-in-action-rust/tree/ch9-ex1-start) · [solution](https://github.com/zuhaib786/oauth2-in-action-rust/compare/ch9-ex1-start...ch9-ex1-done) |
 
 ### One reader's solutions
 
