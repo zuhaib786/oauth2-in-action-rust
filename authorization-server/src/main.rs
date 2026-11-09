@@ -10,10 +10,11 @@ use std::{
     collections::HashMap,
     net::{Ipv4Addr, Ipv6Addr},
     sync::{Arc, LazyLock},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use axum::{
     Form, Json, Router,
     extract::{Query, State},
@@ -29,7 +30,7 @@ use oauth_common::{
     render,
 };
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tower_http::set_header::SetResponseHeaderLayer;
 use url::{Host, Url};
@@ -37,6 +38,14 @@ use url::{Host, Url};
 // authorization server information
 const AUTHORIZATION_ENDPOINT: &str = "http://localhost:9001/authorize";
 const TOKEN_ENDPOINT: &str = "http://localhost:9001/token";
+
+/// The `iss` of every token we issue.
+const ISSUER: &str = "http://localhost:9001/";
+/// The `aud` of our access tokens: the protected resource they're for.
+const PROTECTED_RESOURCE: &str = "http://localhost:9002/";
+/// Seconds an access token stays good. Short, because a self-contained token
+/// can't be called back once it's out.
+const ACCESS_TOKEN_LIFETIME: u64 = 300;
 
 // ---------------------------------------------------------------------------
 // Registered clients
@@ -283,11 +292,33 @@ impl<'a> Grant<'a> {
         Grant { id: random_string(32), client, scope, user }
     }
 
-    /// Creates an access token and saves it for the protected resource.
+    /// Who the token is about: the user's `sub`, or for client credentials
+    /// (no user) the client itself.
+    fn subject(&self) -> &str {
+        match self.user.as_deref().and_then(get_user) {
+            Some(user) => &user.sub,
+            None => &self.client.client_id,
+        }
+    }
+
+    /// Creates an access token: a JWT the protected resource can check on its
+    /// own. A record of it is kept as well, by `jti`.
     fn issue_access_token(&self, db: &Db) -> String {
-        let access_token = random_string(32);
+        let iat = now_secs();
+        let jti = random_string(32);
+        let claims = json!({
+            "iss": ISSUER,
+            "sub": self.subject(),
+            "aud": PROTECTED_RESOURCE,
+            "client_id": self.client.client_id,
+            "scope": self.scope.join(" "),
+            "iat": iat,
+            "exp": iat + ACCESS_TOKEN_LIFETIME,
+            "jti": jti,
+        });
+        let access_token = unsigned_jwt(&json!({ "alg": "none", "typ": "at+jwt" }), &claims);
         db.insert(json!({
-            "access_token": access_token,
+            "jti": jti,
             "client_id": self.client.client_id,
             "scope": self.scope,
             "user": self.user,
@@ -310,6 +341,16 @@ impl<'a> Grant<'a> {
         println!("Issuing refresh token {refresh_token}");
         refresh_token
     }
+}
+
+/// Seconds since 1970: the unit of `iat` and `exp`.
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// `BASE64URL(header) "." BASE64URL(claims) "."`: a JWT with no signature.
+fn unsigned_jwt(header: &Value, claims: &Value) -> String {
+    format!("{}.{}.", URL_SAFE_NO_PAD.encode(header.to_string()), URL_SAFE_NO_PAD.encode(claims.to_string()))
 }
 
 /// Deletes every token issued under a grant.

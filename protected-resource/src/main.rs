@@ -21,8 +21,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use oauth_common::{Db, context, param, parse_form, render};
-use serde_json::{Value, json};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use oauth_common::{context, param, parse_form, render};
+use serde_json::{Map, Value, json};
 use tokio::sync::Mutex;
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
@@ -31,6 +32,13 @@ use tower_http::{
 
 /// Named in every `WWW-Authenticate` challenge.
 const REALM: &str = "localhost:9002";
+
+/// The only issuer whose tokens we take.
+const ISSUER: &str = "http://localhost:9001/";
+/// Who we are, as tokens name us in `aud`.
+const AUDIENCE: &str = "http://localhost:9002/";
+/// How far apart our clock and the authorization server's may be.
+const CLOCK_SKEW: u64 = 30;
 
 /// The only origin whose pages may call these APIs from a browser.
 const CLIENT_ORIGIN: &str = "http://localhost:9000";
@@ -49,8 +57,6 @@ fn cors() -> CorsLayer {
 
 #[derive(Clone)]
 struct AppState {
-    /// Issued tokens, written by the authorization server.
-    db: Db,
     /// The Words API's data (`var savedWords = []` in the JS).
     saved_words: Arc<Mutex<Vec<String>>>,
 }
@@ -93,10 +99,8 @@ impl IntoResponse for Refusal {
 }
 
 /// Finds the access token in the `Authorization: Bearer` header or the form
-/// body (never the URL: RFC 6750 §2.3), then checks it against the database
-/// the authorization server writes to. Returns the stored token record (with
-/// its `client_id`, `scope`, ...).
-fn get_access_token(db: &Db, headers: &HeaderMap, form: &HashMap<String, String>) -> Result<Value, Refusal> {
+/// body (never the URL: RFC 6750 §2.3), then checks it. Returns its claims.
+fn get_access_token(headers: &HeaderMap, form: &HashMap<String, String>) -> Result<Value, Refusal> {
     let from_header = headers
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -112,12 +116,56 @@ fn get_access_token(db: &Db, headers: &HeaderMap, form: &HashMap<String, String>
         (None, None) => return Err(Refusal::NoToken),
     };
 
-    let found = db.find_one(|doc| doc["access_token"] == in_token.as_str());
-    match &found {
-        Some(_) => println!("We found a matching token: {in_token}"),
-        None => println!("No matching token was found."),
+    let claims = check_jwt(&in_token);
+    match &claims {
+        Some(claims) => println!("Accepted a token for {}", claims["sub"]),
+        None => println!("Refused token {in_token}"),
     }
-    found.ok_or(Refusal::InvalidToken)
+    claims.map(Value::Object).ok_or(Refusal::InvalidToken)
+}
+
+/// Decodes one part of a JWT: base64url, then a JSON object.
+fn decode_part(part: &str) -> Option<Map<String, Value>> {
+    let bytes = URL_SAFE_NO_PAD.decode(part).ok()?;
+    match serde_json::from_slice(&bytes).ok()? {
+        Value::Object(object) => Some(object),
+        _ => None,
+    }
+}
+
+/// Checks an unsigned JWT access token (RFC 9068 §4) and returns its claims.
+fn check_jwt(token: &str) -> Option<Map<String, Value>> {
+    let parts: Vec<&str> = token.split('.').collect();
+    let [header, claims, signature] = parts[..] else {
+        return None;
+    };
+    let header = decode_part(header)?;
+    let claims = decode_part(claims)?;
+
+    // "none" is all we can check, so it's all we take: for now.
+    if header.get("alg")? != "none" || !signature.is_empty() {
+        return None;
+    }
+    let typ = header.get("typ")?.as_str()?.to_ascii_lowercase();
+    if typ != "at+jwt" && typ != "application/at+jwt" {
+        return None;
+    }
+
+    let now = now_secs();
+    let for_us = match claims.get("aud")? {
+        Value::String(aud) => aud == AUDIENCE,
+        Value::Array(auds) => auds.iter().any(|aud| aud == AUDIENCE),
+        _ => false,
+    };
+    let unexpired = claims.get("exp")?.as_u64()? + CLOCK_SKEW > now;
+    let started = claims.get("nbf").is_none_or(|nbf| nbf.as_u64().is_some_and(|nbf| nbf <= now + CLOCK_SKEW));
+    let valid = claims.get("iss")? == ISSUER && for_us && unexpired && started;
+    valid.then_some(claims)
+}
+
+/// Seconds since 1970, the unit of `exp` and `nbf`.
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 /// Is this body a form we may look for a token in? (RFC 6750 §2.2)
@@ -137,20 +185,20 @@ fn has_form_body(method: &Method, headers: &HeaderMap) -> bool {
 /// calls the handler. This replaces the book's `getAccessToken` and
 /// `requireAccessToken` Express middleware.
 struct AccessToken {
-    /// The token's record from the database: `client_id`, `scope`, ...
-    record: Value,
+    /// The token's claims: `sub`, `client_id`, `scope`, ...
+    claims: Value,
     /// The request's form body. We had to read the body to look for a token
     /// in it, so handlers that need other form fields get them from here.
     form: HashMap<String, String>,
 }
 
 impl AccessToken {
-    /// True if the token was issued with this scope. Stored scopes are a JSON
-    /// list like `["read", "write"]`.
+    /// True if the token was issued with this scope. The `scope` claim is
+    /// space-separated, like `"read write"`.
     fn has_scope(&self, scope: &str) -> bool {
-        self.record["scope"]
-            .as_array()
-            .is_some_and(|scopes| scopes.iter().any(|s| s == scope))
+        self.claims["scope"]
+            .as_str()
+            .is_some_and(|scopes| scopes.split(' ').any(|s| s == scope))
     }
 }
 
@@ -158,7 +206,7 @@ impl AccessToken {
 impl FromRequest<AppState> for AccessToken {
     type Rejection = Refusal;
 
-    async fn from_request(req: Request, state: &AppState) -> Result<Self, Self::Rejection> {
+    async fn from_request(req: Request, _state: &AppState) -> Result<Self, Self::Rejection> {
         let (parts, body) = req.into_parts();
         let form = if has_form_body(&parts.method, &parts.headers) {
             let body = axum::body::to_bytes(body, 64 * 1024).await.map_err(|_| Refusal::InvalidRequest)?;
@@ -167,8 +215,8 @@ impl FromRequest<AppState> for AccessToken {
             HashMap::new()
         };
 
-        let record = get_access_token(&state.db, &parts.headers, &form)?;
-        Ok(AccessToken { record, form })
+        let claims = get_access_token(&parts.headers, &form)?;
+        Ok(AccessToken { claims, form })
     }
 }
 
@@ -247,10 +295,10 @@ async fn favorites(token: AccessToken) -> Response {
         "music": ["baroque", "ukulele", "baroque ukulele"],
     });
 
-    // The authorization server recorded who approved this token.
-    let response = match token.record["user"].as_str() {
-        Some("alice") => json!({ "user": "Alice", "favorites": alice_favorites }),
-        Some("bob") => json!({ "user": "Bob", "favorites": bob_favorites }),
+    // The token says whose it is.
+    let response = match token.claims["sub"].as_str() {
+        Some("9XE3-JI34-00132A") => json!({ "user": "Alice", "favorites": alice_favorites }),
+        Some("1ZT5-OE63-57383B") => json!({ "user": "Bob", "favorites": bob_favorites }),
         _ => json!({ "user": "Unknown", "favorites": { "movies": [], "foods": [], "music": [] } }),
     };
     Json(response).into_response()
@@ -278,7 +326,7 @@ async fn hello_world(Query(query): Query<HashMap<String, String>>, _token: Acces
 async fn main() {
     oauth_common::set_views_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/templates"));
 
-    let state = AppState { db: Db::shared(), saved_words: Arc::default() };
+    let state = AppState { saved_words: Arc::default() };
 
     let app = Router::new()
         .route("/", get(|| async { render("index", context! {}) }))
