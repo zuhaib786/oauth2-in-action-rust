@@ -17,11 +17,11 @@ use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::{
     Form, Json, Router,
     body::Bytes,
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{
         HeaderMap, HeaderName, HeaderValue, StatusCode,
         header::{
-            CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, WWW_AUTHENTICATE, PRAGMA, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS,
+            AUTHORIZATION, CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, WWW_AUTHENTICATE, PRAGMA, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS,
             X_FRAME_OPTIONS,
         },
     },
@@ -42,6 +42,7 @@ use url::{Host, Url};
 // authorization server information
 const AUTHORIZATION_ENDPOINT: &str = "http://localhost:9001/authorize";
 const TOKEN_ENDPOINT: &str = "http://localhost:9001/token";
+const REGISTRATION_ENDPOINT: &str = "http://localhost:9001/register";
 
 /// The `iss` of every token we issue.
 const ISSUER: &str = "http://localhost:9001/";
@@ -135,9 +136,20 @@ struct Client {
     client_uri: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     logo_uri: Option<String>,
+    /// For registered clients: when they registered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_id_issued_at: Option<u64>,
+    /// For registered clients: lets them manage their registration (RFC 7592).
+    #[serde(skip)]
+    registration_access_token: Option<String>,
 }
 
 impl Client {
+    /// `code` goes with the authorization_code grant, and nothing else is supported.
+    fn response_types(&self) -> Vec<&'static str> {
+        if self.allows_grant("authorization_code") { vec!["code"] } else { vec![] }
+    }
+
     fn allows_grant(&self, grant_type: &str) -> bool {
         self.grant_types.iter().any(|g| g == grant_type)
     }
@@ -187,6 +199,8 @@ fn built_in_clients() -> Vec<Client> {
             client_name: None,
             client_uri: None,
             logo_uri: None,
+            client_id_issued_at: None,
+            registration_access_token: None,
         },
         Client {
             client_id: "oauth-client-implicit".into(),
@@ -198,6 +212,8 @@ fn built_in_clients() -> Vec<Client> {
             client_name: None,
             client_uri: None,
             logo_uri: None,
+            client_id_issued_at: None,
+            registration_access_token: None,
         },
         Client {
             client_id: "oauth-client-service".into(),
@@ -209,6 +225,8 @@ fn built_in_clients() -> Vec<Client> {
             client_name: None,
             client_uri: None,
             logo_uri: None,
+            client_id_issued_at: None,
+            registration_access_token: None,
         },
         Client {
             client_id: "oauth-native-client".into(),
@@ -220,6 +238,8 @@ fn built_in_clients() -> Vec<Client> {
             client_name: None,
             client_uri: None,
             logo_uri: None,
+            client_id_issued_at: None,
+            registration_access_token: None,
         },
         Client {
             client_id: "oauth-client-trusted".into(),
@@ -231,6 +251,8 @@ fn built_in_clients() -> Vec<Client> {
             client_name: None,
             client_uri: None,
             logo_uri: None,
+            client_id_issued_at: None,
+            registration_access_token: None,
         },
     ]
 }
@@ -245,6 +267,7 @@ fn get_client(client_id: &str) -> Option<Arc<Client>> {
     CLIENTS.read().unwrap_or_else(PoisonError::into_inner).get(client_id).cloned()
 }
 
+/// Adds a client, or replaces the one with the same `client_id`.
 fn add_client(client: Client) {
     CLIENTS.write().unwrap_or_else(PoisonError::into_inner).insert(client.client_id.clone(), Arc::new(client));
 }
@@ -1014,10 +1037,37 @@ struct ClientMetadata {
     logo_uri: Option<String>,
 }
 
-/// 400 with a registration error (RFC 7591 §3.2.2).
-fn registration_error(error: &str, description: &str) -> Response {
-    println!("Registration refused: {description}");
-    (StatusCode::BAD_REQUEST, Json(json!({ "error": error, "error_description": description }))).into_response()
+/// What a client sends to replace its registration (RFC 7592 §2.2).
+#[derive(Deserialize)]
+struct ClientUpdate {
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    #[serde(flatten)]
+    metadata: ClientMetadata,
+}
+
+/// Why the metadata was refused (RFC 7591 §3.2.2).
+struct InvalidMetadata {
+    error: &'static str,
+    description: String,
+}
+
+impl InvalidMetadata {
+    fn client_metadata(description: impl Into<String>) -> Self {
+        InvalidMetadata { error: "invalid_client_metadata", description: description.into() }
+    }
+
+    fn redirect_uri(description: impl Into<String>) -> Self {
+        InvalidMetadata { error: "invalid_redirect_uri", description: description.into() }
+    }
+}
+
+impl IntoResponse for InvalidMetadata {
+    fn into_response(self) -> Response {
+        println!("Registration refused: {}", self.description);
+        let body = json!({ "error": self.error, "error_description": self.description });
+        (StatusCode::BAD_REQUEST, Json(body)).into_response()
+    }
 }
 
 /// https anywhere, or http to this machine (RFC 8252 §7.3); never a fragment.
@@ -1035,48 +1085,45 @@ fn is_web_url(uri: &str) -> bool {
     Url::parse(uri).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
 }
 
-/// `POST /register`: a client introduces itself.
-async fn register(body: Bytes) -> Response {
-    let Ok(metadata) = serde_json::from_slice::<ClientMetadata>(&body) else {
-        return registration_error("invalid_client_metadata", "the body isn't client metadata in JSON");
-    };
-
+/// Checks client metadata and makes a new client of it, with a fresh id,
+/// secret and registration access token.
+fn client_from_metadata(metadata: ClientMetadata) -> Result<Client, InvalidMetadata> {
     let auth_method = metadata.token_endpoint_auth_method.unwrap_or(AuthMethod::Basic);
     let grant_types = metadata.grant_types.unwrap_or_else(|| vec!["authorization_code".into()]);
     if let Some(bad) = grant_types.iter().find(|g| !REGISTRABLE_GRANT_TYPES.contains(&g.as_str())) {
-        return registration_error("invalid_client_metadata", &format!("grant type {bad} isn't available"));
+        return Err(InvalidMetadata::client_metadata(format!("grant type {bad} isn't available")));
     }
     if auth_method == AuthMethod::Public && grant_types.iter().any(|g| g == "client_credentials") {
-        return registration_error("invalid_client_metadata", "a public client can't use client_credentials");
+        return Err(InvalidMetadata::client_metadata("a public client can't use client_credentials"));
     }
 
-    // "code" goes with authorization_code, and nothing else is supported
     let uses_code = grant_types.iter().any(|g| g == "authorization_code");
     let expected_response_types: &[&str] = if uses_code { &["code"] } else { &[] };
-    let response_types = metadata.response_types.unwrap_or_else(|| expected_response_types.iter().map(|t| t.to_string()).collect());
-    if !response_types.iter().map(String::as_str).eq(expected_response_types.iter().copied()) {
-        return registration_error("invalid_client_metadata", "response_types don't match grant_types");
+    if let Some(response_types) = metadata.response_types {
+        if !response_types.iter().map(String::as_str).eq(expected_response_types.iter().copied()) {
+            return Err(InvalidMetadata::client_metadata("response_types don't match grant_types"));
+        }
     }
 
     let redirect_uris = metadata.redirect_uris.unwrap_or_default();
     if uses_code && redirect_uris.is_empty() {
-        return registration_error("invalid_redirect_uri", "the authorization_code grant needs a redirect URI");
+        return Err(InvalidMetadata::redirect_uri("the authorization_code grant needs a redirect URI"));
     }
     if let Some(bad) = redirect_uris.iter().find(|uri| !is_acceptable_redirect_uri(uri)) {
-        return registration_error("invalid_redirect_uri", &format!("{bad} isn't an acceptable redirect URI"));
+        return Err(InvalidMetadata::redirect_uri(format!("{bad} isn't an acceptable redirect URI")));
     }
 
     let scope = metadata.scope.unwrap_or_default();
     if let Some(bad) = split_scope(&scope).iter().find(|s| !KNOWN_SCOPES.contains(&s.as_str())) {
-        return registration_error("invalid_client_metadata", &format!("unknown scope {bad}"));
+        return Err(InvalidMetadata::client_metadata(format!("unknown scope {bad}")));
     }
     for uri in [&metadata.client_uri, &metadata.logo_uri].into_iter().flatten() {
         if !is_web_url(uri) {
-            return registration_error("invalid_client_metadata", &format!("{uri} isn't an http(s) URL"));
+            return Err(InvalidMetadata::client_metadata(format!("{uri} isn't an http(s) URL")));
         }
     }
 
-    let client = Client {
+    Ok(Client {
         client_id: random_string(32),
         client_secret: (auth_method != AuthMethod::Public).then(|| random_string(32)),
         token_endpoint_auth_method: auth_method,
@@ -1086,18 +1133,106 @@ async fn register(body: Bytes) -> Response {
         client_name: metadata.client_name,
         client_uri: metadata.client_uri,
         logo_uri: metadata.logo_uri,
-    };
+        client_id_issued_at: Some(now_secs()),
+        registration_access_token: Some(random_string(32)),
+    })
+}
 
-    let mut answer = serde_json::to_value(&client).expect("a client serializes");
-    answer["response_types"] = json!(response_types);
-    answer["client_id_issued_at"] = json!(now_secs());
+/// A client's registration, as /register and its registration URI show it.
+fn registration_answer(client: &Client) -> Value {
+    let mut answer = serde_json::to_value(client).expect("a client serializes");
+    answer["response_types"] = json!(client.response_types());
     if let Some(secret) = &client.client_secret {
         answer["client_secret"] = json!(secret);
         answer["client_secret_expires_at"] = json!(0);
     }
+    if client.registration_access_token.is_some() {
+        answer["registration_client_uri"] = json!(format!("{REGISTRATION_ENDPOINT}/{}", client.client_id));
+    }
+    answer
+}
+
+/// `POST /register`: a client introduces itself.
+async fn register(body: Bytes) -> Response {
+    let client = serde_json::from_slice(&body)
+        .map_err(|_| InvalidMetadata::client_metadata("the body isn't client metadata in JSON"))
+        .and_then(client_from_metadata);
+    let client = match client {
+        Ok(client) => client,
+        Err(invalid) => return invalid.into_response(),
+    };
+
+    let mut answer = registration_answer(&client);
+    answer["registration_access_token"] = json!(client.registration_access_token);
     println!("Registered client {}", client.client_id);
     add_client(client);
     (StatusCode::CREATED, Json(answer)).into_response()
+}
+
+/// The client whose registration URI this is, if the request carries its
+/// registration access token.
+fn managed_client(client_id: &str, headers: &HeaderMap) -> Option<Arc<Client>> {
+    let token = headers.get(AUTHORIZATION)?.to_str().ok()?.strip_prefix("Bearer ")?;
+    let client = get_client(client_id)?;
+    (client.registration_access_token.as_deref() == Some(token)).then_some(client)
+}
+
+/// 401 for a registration URI without the right token. It doesn't say
+/// whether the client exists.
+fn bad_registration_token() -> Response {
+    (StatusCode::UNAUTHORIZED, [(WWW_AUTHENTICATE, r#"Bearer error="invalid_token""#)]).into_response()
+}
+
+/// `GET /register/{client_id}` (RFC 7592 §2.1).
+async fn read_registration(Path(client_id): Path<String>, headers: HeaderMap) -> Response {
+    let Some(client) = managed_client(&client_id, &headers) else {
+        return bad_registration_token();
+    };
+    Json(registration_answer(&client)).into_response()
+}
+
+/// `PUT /register/{client_id}` (RFC 7592 §2.2): replaces the registration.
+async fn update_registration(Path(client_id): Path<String>, headers: HeaderMap, body: Bytes) -> Response {
+    let Some(current) = managed_client(&client_id, &headers) else {
+        return bad_registration_token();
+    };
+    let Ok(update) = serde_json::from_slice::<ClientUpdate>(&body) else {
+        return InvalidMetadata::client_metadata("the body isn't client metadata in JSON").into_response();
+    };
+    if update.client_id.as_deref() != Some(client_id.as_str()) {
+        return InvalidMetadata::client_metadata("client_id must be the one being updated").into_response();
+    }
+    if update.client_secret.is_some() && update.client_secret != current.client_secret {
+        return InvalidMetadata::client_metadata("a client can't choose its own secret").into_response();
+    }
+
+    let mut client = match client_from_metadata(update.metadata) {
+        Ok(client) => client,
+        Err(invalid) => return invalid.into_response(),
+    };
+    // what the client can't change
+    client.client_id = current.client_id.clone();
+    if client.client_secret.is_some() && current.client_secret.is_some() {
+        client.client_secret = current.client_secret.clone();
+    }
+    client.client_id_issued_at = current.client_id_issued_at;
+    client.registration_access_token = current.registration_access_token.clone();
+
+    let answer = registration_answer(&client);
+    println!("Updated client {client_id}");
+    add_client(client);
+    Json(answer).into_response()
+}
+
+/// `DELETE /register/{client_id}` (RFC 7592 §2.3): the client and its tokens go.
+async fn delete_registration(State(app): State<AppState>, Path(client_id): Path<String>, headers: HeaderMap) -> Response {
+    if managed_client(&client_id, &headers).is_none() {
+        return bad_registration_token();
+    }
+    CLIENTS.write().unwrap_or_else(PoisonError::into_inner).remove(&client_id);
+    let revoked = app.db.remove(|doc| doc["client_id"] == client_id.as_str());
+    println!("Deleted client {client_id} and its {revoked} tokens");
+    StatusCode::NO_CONTENT.into_response()
 }
 
 fn requested_scope(client: &Client, body: &HashMap<String, String>) -> Option<Vec<String>> {
@@ -1235,6 +1370,10 @@ async fn main() {
         .route("/introspect", post(introspect))
         .route("/revoke", post(revoke))
         .route("/register", post(register))
+        .route(
+            "/register/{client_id}",
+            get(read_registration).put(update_registration).delete(delete_registration),
+        )
         .layer(set_header(CACHE_CONTROL, "no-store"))
         .layer(set_header(PRAGMA, "no-cache"));
 
