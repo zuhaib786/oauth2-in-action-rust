@@ -9,8 +9,10 @@
 use std::{
     collections::HashMap,
     sync::{Arc, LazyLock},
+    time::{Duration, Instant},
 };
 
+use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::{
     Form, Json, Router,
     extract::{Query, State},
@@ -22,7 +24,7 @@ use oauth_common::{
     Db, build_url, build_url_with_fragment, context, decode_client_credentials, param, random_string, render,
 };
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::json;
 use tokio::sync::Mutex;
 
 // authorization server information
@@ -75,6 +77,13 @@ static CLIENTS: LazyLock<Vec<Client>> = LazyLock::new(|| {
             scope: "read write".into(),
             grant_types: vec!["client_credentials".into()],
         },
+        Client {
+            client_id: "oauth-client-trusted".into(),
+            client_secret: Some("oauth-client-secret-trusted".into()),
+            redirect_uris: vec![],
+            scope: "foo bar read write".into(),
+            grant_types: vec!["password".into(), "refresh_token".into()],
+        },
     ]
 });
 
@@ -110,14 +119,14 @@ impl ResponseType {
 }
 
 /// The grant types the token endpoint knows.
-const TOKEN_GRANT_TYPES: &[&str] = &["authorization_code", "refresh_token", "client_credentials"];
+const TOKEN_GRANT_TYPES: &[&str] = &["authorization_code", "refresh_token", "client_credentials", "password"];
 
 // ---------------------------------------------------------------------------
 // Users (resource owners)
 // ---------------------------------------------------------------------------
 
-/// Someone who can approve clients. There are no passwords yet: the approval
-/// page simply asks which user you are.
+/// Someone who can approve clients. The approval page simply asks which user
+/// you are; only the password grant checks passwords.
 #[derive(Clone, Debug, Serialize)]
 struct User {
     sub: String,
@@ -125,6 +134,10 @@ struct User {
     name: String,
     email: String,
     email_verified: bool,
+    /// An Argon2id hash in PHC format, as a database would hold it. Never
+    /// serialized, so it can't end up in a page or a response.
+    #[serde(skip)]
+    password_hash: String,
 }
 
 static USERS: LazyLock<Vec<User>> = LazyLock::new(|| {
@@ -135,6 +148,7 @@ static USERS: LazyLock<Vec<User>> = LazyLock::new(|| {
             name: "Alice".into(),
             email: "alice.wonderland@example.com".into(),
             email_verified: true,
+            password_hash: "$argon2id$v=19$m=19456,t=2,p=1$zG2gnxnrgzuLxABrRRxn1w$qY9m21L9gRUHtwby7NWvn9EHVwUEEqExefJ0e22h7sI".into(),
         },
         User {
             sub: "1ZT5-OE63-57383B".into(),
@@ -142,12 +156,48 @@ static USERS: LazyLock<Vec<User>> = LazyLock::new(|| {
             name: "Bob".into(),
             email: "bob.loblob@example.net".into(),
             email_verified: false,
+            password_hash: "$argon2id$v=19$m=19456,t=2,p=1$USNNMw5hK+ilxKFjK8VmwQ$tNA37MDD4UfneGlg0eSuGyBTBEDZQjL4r/5w9RQfFQw".into(),
+        },
+        User {
+            sub: "5UAL-CA03-60913C".into(),
+            preferred_username: "carol".into(),
+            name: "Carol".into(),
+            email: "carol@example.org".into(),
+            email_verified: true,
+            password_hash: "$argon2id$v=19$m=19456,t=2,p=1$GLluuuqw1akW95bjVRLkOw$YfuA5DRlSlvNlslQOwZZvzNtkjiDM1rU1vbnJX9ZyLM".into(),
         },
     ]
 });
 
 fn get_user(username: &str) -> Option<&'static User> {
     USERS.iter().find(|user| user.preferred_username == username)
+}
+
+/// Checked when the username is unknown, so that takes as long as a wrong
+/// password and the response time doesn't say which usernames exist.
+const DUMMY_PASSWORD_HASH: &str =
+    "$argon2id$v=19$m=19456,t=2,p=1$0eFanii02Ip3tLiUwqjjGQ$lZxOlwPFr0XHN2F8pobLuJzdFbnszgK3YO/ZoZbHzxM";
+
+/// Checks a password against a PHC hash string. Argon2 is slow on purpose,
+/// so this runs on a thread meant for blocking work, not on the async runtime.
+async fn password_matches(hash: &'static str, password: String) -> bool {
+    tokio::task::spawn_blocking(move || {
+        PasswordHash::new(hash)
+            .is_ok_and(|hash| Argon2::default().verify_password(password.as_bytes(), &hash).is_ok())
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// After this many failed password logins in a row, a username is locked.
+const MAX_FAILED_LOGINS: u32 = 5;
+const LOCKOUT: Duration = Duration::from_secs(60);
+
+/// Recent failed password logins for one username.
+#[derive(Default)]
+struct FailedLogins {
+    count: u32,
+    locked_until: Option<Instant>,
 }
 
 // ---------------------------------------------------------------------------
@@ -175,6 +225,31 @@ struct ServerState {
     /// /authorize requests waiting for the user to click Approve or Deny,
     /// keyed by a random request id that goes into the approval form.
     requests: HashMap<String, HashMap<String, String>>,
+    /// The password grant's brute-force guard, by username.
+    failed_logins: HashMap<String, FailedLogins>,
+}
+
+impl ServerState {
+    fn is_locked_out(&self, username: &str) -> bool {
+        self.failed_logins
+            .get(username)
+            .and_then(|failures| failures.locked_until)
+            .is_some_and(|until| Instant::now() < until)
+    }
+
+    fn record_login(&mut self, username: &str, succeeded: bool) {
+        if succeeded {
+            self.failed_logins.remove(username);
+            return;
+        }
+        let failures = self.failed_logins.entry(username.to_string()).or_default();
+        failures.count += 1;
+        if failures.count >= MAX_FAILED_LOGINS {
+            println!("Too many failed logins for {username}, locking it for {LOCKOUT:?}");
+            failures.count = 0;
+            failures.locked_until = Some(Instant::now() + LOCKOUT);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -437,6 +512,7 @@ async fn token(
         "authorization_code" => authorization_code_grant(&app, client, &body).await,
         "refresh_token" => refresh_token_grant(&app, client, &body),
         "client_credentials" => client_credentials_grant(&app, client, &body),
+        "password" => password_grant(&app, client, &body).await,
         _ => unreachable!("checked against TOKEN_GRANT_TYPES"),
     }
 }
@@ -462,24 +538,49 @@ async fn authorization_code_grant(
     }
 
     let access_token = issue_access_token(&app.db, client, &code.scope, Some(&code.user));
+    let refresh_token = issue_refresh_token(&app.db, client, &code.scope, Some(&code.user));
+    println!("Issued tokens for code {code_value}");
+    token_response(&access_token, Some(&refresh_token), &code.scope)
+}
+
+/// Creates a refresh token and saves it for later refresh_token grants.
+fn issue_refresh_token(db: &Db, client: &Client, scope: &[String], user: Option<&str>) -> String {
     let refresh_token = random_string(32);
-    app.db.insert(json!({
+    db.insert(json!({
         "refresh_token": refresh_token,
         "client_id": client.client_id,
-        "scope": code.scope,
-        "user": code.user,
+        "scope": scope,
+        "user": user,
     }));
+    println!("Issuing refresh token {refresh_token}");
+    refresh_token
+}
 
-    let cscope = code.scope.join(" ");
-    println!("and refresh token {refresh_token} for code {code_value}");
-
-    Json(json!({
+/// A successful token endpoint response (RFC 6749 §5.1).
+fn token_response(access_token: &str, refresh_token: Option<&str>, scope: &[String]) -> Response {
+    let mut body = json!({
         "access_token": access_token,
         "token_type": "Bearer",
-        "refresh_token": refresh_token,
-        "scope": cscope,
-    }))
-    .into_response()
+        "scope": scope.join(" "),
+    });
+    if let Some(refresh_token) = refresh_token {
+        body["refresh_token"] = json!(refresh_token);
+    }
+    Json(body).into_response()
+}
+
+/// The scopes a grant without a user's approval page gets: the requested
+/// ones if they're all allowed, every allowed one if none were requested,
+/// or `None` if the client asked for one it may not have.
+fn requested_scope(client: &Client, body: &HashMap<String, String>) -> Option<Vec<String>> {
+    let cscope = split_scope(&client.scope);
+    match body.get("scope") {
+        Some(requested) => {
+            let rscope = split_scope(requested);
+            (!has_extra_scope(&rscope, &cscope)).then_some(rscope)
+        }
+        None => Some(cscope),
+    }
 }
 
 /// grant_type=refresh_token: trade a refresh token for a new access token,
@@ -500,22 +601,10 @@ fn refresh_token_grant(app: &AppState, client: &Client, body: &HashMap<String, S
         return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
     }
 
-    let access_token = random_string(32);
-    app.db.insert(json!({
-        "access_token": access_token,
-        "client_id": client.client_id,
-        "scope": token["scope"],
-        "user": token["user"],
-    }));
-    println!("Issuing access token {access_token} for refresh token {refresh_token}");
-
-    Json(json!({
-        "access_token": access_token,
-        "token_type": "Bearer",
-        "refresh_token": refresh_token,
-        "scope": scope_to_string(&token["scope"]),
-    }))
-    .into_response()
+    let scope: Vec<String> = serde_json::from_value(token["scope"].clone()).unwrap_or_default();
+    let access_token = issue_access_token(&app.db, client, &scope, token["user"].as_str());
+    println!("for refresh token {refresh_token}");
+    token_response(&access_token, Some(refresh_token), &scope)
 }
 
 /// grant_type=client_credentials: the client gets a token for itself. No
@@ -527,33 +616,51 @@ fn client_credentials_grant(app: &AppState, client: &Client, body: &HashMap<Stri
         return json_error(StatusCode::BAD_REQUEST, "unauthorized_client");
     }
 
-    let cscope = split_scope(&client.scope);
-    let scope = match body.get("scope") {
-        Some(requested) => split_scope(requested),
-        None => cscope.clone(),
-    };
-    if has_extra_scope(&scope, &cscope) {
-        println!("Client {} asked for scopes it may not have: {scope:?}", client.client_id);
+    let Some(scope) = requested_scope(client, body) else {
+        println!("Client {} asked for scopes it may not have", client.client_id);
         return json_error(StatusCode::BAD_REQUEST, "invalid_scope");
-    }
+    };
 
     // No refresh token: the client can just ask again (RFC 6749 §4.4.3).
     let access_token = issue_access_token(&app.db, client, &scope, None);
-    Json(json!({
-        "access_token": access_token,
-        "token_type": "Bearer",
-        "scope": scope.join(" "),
-    }))
-    .into_response()
+    token_response(&access_token, None, &scope)
 }
 
-/// Turns a scope list stored in the database (`["foo", "bar"]`) back into
-/// the space-separated string OAuth uses on the wire (`"foo bar"`).
-fn scope_to_string(scope: &Value) -> String {
-    scope
-        .as_array()
-        .map(|list| list.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "))
-        .unwrap_or_default()
+/// grant_type=password: the client sends the user's own username and
+/// password. Deprecated (RFC 9700 §2.4), and the reason this server has to
+/// handle passwords at all.
+async fn password_grant(app: &AppState, client: &Client, body: &HashMap<String, String>) -> Response {
+    let username = param(body, "username");
+
+    let Some(scope) = requested_scope(client, body) else {
+        println!("Client {} asked for scopes it may not have", client.client_id);
+        return json_error(StatusCode::BAD_REQUEST, "invalid_scope");
+    };
+
+    // RFC 6749 §4.3.2: "MUST protect the endpoint against brute force attacks"
+    if app.inner.lock().await.is_locked_out(username) {
+        println!("Refusing {username}: locked out after too many failed logins");
+        return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
+    }
+
+    let user = get_user(username);
+    let hash = user.map_or(DUMMY_PASSWORD_HASH, |user| user.password_hash.as_str());
+    let password_ok = password_matches(hash, param(body, "password").to_string()).await;
+
+    let user = user.filter(|_| password_ok);
+    app.inner.lock().await.record_login(username, user.is_some());
+
+    // The same answer for an unknown user and a wrong password.
+    let Some(user) = user else {
+        println!("Wrong username or password for {username}");
+        return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
+    };
+
+    let access_token = issue_access_token(&app.db, client, &scope, Some(&user.preferred_username));
+    let refresh_token = client
+        .allows_grant("refresh_token")
+        .then(|| issue_refresh_token(&app.db, client, &scope, Some(&user.preferred_username)));
+    token_response(&access_token, refresh_token.as_deref(), &scope)
 }
 
 #[tokio::main]
