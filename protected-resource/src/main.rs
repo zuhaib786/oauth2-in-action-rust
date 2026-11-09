@@ -8,7 +8,7 @@
 use std::{
     collections::HashMap,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -24,10 +24,28 @@ use axum::{
 use oauth_common::{Db, context, param, parse_form, render};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
-use tower_http::{cors::CorsLayer, set_header::SetResponseHeaderLayer};
+use tower_http::{
+    cors::{AllowOrigin, CorsLayer},
+    set_header::SetResponseHeaderLayer,
+};
 
 /// Named in every `WWW-Authenticate` challenge.
 const REALM: &str = "localhost:9002";
+
+/// The only origin whose pages may call these APIs from a browser.
+const CLIENT_ORIGIN: &str = "http://localhost:9000";
+
+/// CORS for the client app's origin and nobody else. `list` (unlike `exact`)
+/// leaves the header out entirely when the origin doesn't match.
+fn cors() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list([HeaderValue::from_static(CLIENT_ORIGIN)]))
+        .allow_methods([Method::GET, Method::POST, Method::DELETE])
+        .allow_headers([AUTHORIZATION, CONTENT_TYPE])
+        // so a script can see why it was refused
+        .expose_headers([WWW_AUTHENTICATE])
+        .max_age(Duration::from_secs(600))
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -269,7 +287,7 @@ async fn main() {
         .route("/produce", get(produce))
         .route("/favorites", get(favorites))
         .route("/helloWorld", get(hello_world))
-        .layer(CorsLayer::permissive()) // `app.use(cors())`
+        .layer(cors())
         // Browsers must not guess that a JSON answer is really HTML.
         .layer(SetResponseHeaderLayer::overriding(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff")))
         .with_state(state);
