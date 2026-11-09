@@ -122,6 +122,7 @@ outside (how you store passwords, say). The spec marks those "not tested".
 | 6-5 | `ch6-ex5` | A `native-client` CLI with a loopback redirect. Authorization server: any port on loopback | [spec](exercises/ch6-ex5.md) | [start](https://github.com/zuhaib786/oauth2-in-action-rust/tree/ch6-ex5-start) · [solution](https://github.com/zuhaib786/oauth2-in-action-rust/compare/ch6-ex5-start...ch6-ex5-done) |
 | 7-1 | `ch7-ex1` | Client: per-browser sessions, single-use `state`, no code leaking through `Referer` | [spec](exercises/ch7-ex1.md) | [start](https://github.com/zuhaib786/oauth2-in-action-rust/tree/ch7-ex1-start) · [solution](https://github.com/zuhaib786/oauth2-in-action-rust/compare/ch7-ex1-start...ch7-ex1-done) |
 | 8-1 | `ch8-ex1` | Protected resource: fix an XSS, proper `WWW-Authenticate` challenges, no tokens in URLs | [spec](exercises/ch8-ex1.md) | [start](https://github.com/zuhaib786/oauth2-in-action-rust/tree/ch8-ex1-start) · [solution](https://github.com/zuhaib786/oauth2-in-action-rust/compare/ch8-ex1-start...ch8-ex1-done) |
+| 8-2 | `ch8-ex2` | Protected resource: CORS for one origin, not for everyone | [spec](exercises/ch8-ex2.md) | [start](https://github.com/zuhaib786/oauth2-in-action-rust/tree/ch8-ex2-start) · [solution](https://github.com/zuhaib786/oauth2-in-action-rust/compare/ch8-ex2-start...ch8-ex2-done) |
 
 ### One reader's solutions
 
