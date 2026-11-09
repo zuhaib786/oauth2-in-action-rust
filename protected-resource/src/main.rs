@@ -141,7 +141,7 @@ fn now_millis() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-async fn get_words(State(app): State<AppState>, token: AccessToken) -> Response {
+async fn get_words(State(app): State<AppState>, token: AccessToken) -> Result<Response, Response> {
     /*
      * TODO: Make this function require the "read" scope.
      *
@@ -154,26 +154,42 @@ async fn get_words(State(app): State<AppState>, token: AccessToken) -> Response 
      *         )
      *             .into_response()
      */
+    require_scope(&token, "read")?;
     let saved_words = app.saved_words.lock().await;
-    Json(json!({ "words": saved_words.join(" "), "timestamp": now_millis() })).into_response()
+    Ok(Json(json!({ "words": saved_words.join(" "), "timestamp": now_millis() })).into_response())
 }
 
-async fn add_word(State(app): State<AppState>, token: AccessToken) -> Response {
+async fn add_word(State(app): State<AppState>, token: AccessToken) -> Result<Response, Response> {
     /*
      * TODO: Make this function require the "write" scope
      */
+    require_scope(&token, "write")?;
     if let Some(word) = token.form.get("word") {
         app.saved_words.lock().await.push(word.clone());
     }
-    StatusCode::CREATED.into_response()
+    Ok(StatusCode::CREATED.into_response())
 }
 
-async fn delete_word(State(app): State<AppState>, token: AccessToken) -> Response {
+fn require_scope(access_token: &AccessToken, scope: &str) -> Result<(), Response> {
+    if access_token.has_scope(scope) {
+        return Ok(());
+    }
+    println!("Missing required scope: {scope}");
+    let challenge =
+        format!(r#"Bearer realm="localhost:9002", error="insufficient_scope", scope="{scope}""#);
+    Err((StatusCode::FORBIDDEN, [("WWW-Authenticate", challenge)]).into_response())
+}
+
+async fn delete_word(
+    State(app): State<AppState>,
+    token: AccessToken,
+) -> Result<Response, Response> {
     /*
      * TODO: Make this function require the "delete" scope
      */
+    require_scope(&token, "delete")?;
     app.saved_words.lock().await.pop();
-    StatusCode::NO_CONTENT.into_response()
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 #[tokio::main]
