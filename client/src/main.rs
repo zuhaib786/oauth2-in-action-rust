@@ -23,7 +23,9 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
     routing::get,
 };
-use oauth_common::{build_url, context, encode_client_credentials, param, random_string, render};
+use oauth_common::{
+    build_url, context, encode_client_credentials, param, pkce_challenge, random_string, render,
+};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -67,6 +69,8 @@ const FAVORITES_API: &str = "http://localhost:9002/favorites";
 struct ClientState {
     /// The `state` of the login this browser has in progress, if any.
     state: Option<String>,
+    /// That login's PKCE code verifier (chapter 10).
+    code_verifier: Option<String>,
     access_token: Option<String>,
     scope: Option<String>,
     refresh_token: Option<String>,
@@ -163,6 +167,11 @@ async fn authorize(Extension(session): Extension<Session>) -> Response {
     let state = random_string(32);
     s.state = Some(state.clone());
 
+    // PKCE: the server only ever sees the challenge until we redeem the code.
+    let code_verifier = random_string(64);
+    let code_challenge = pkce_challenge(&code_verifier);
+    s.code_verifier = Some(code_verifier);
+
     let authorize_url = build_url(
         AUTH_SERVER.authorization_endpoint,
         &[
@@ -171,6 +180,8 @@ async fn authorize(Extension(session): Extension<Session>) -> Response {
             ("client_id", CLIENT.client_id),
             ("redirect_uri", CLIENT.redirect_uris[0]),
             ("state", &state),
+            ("code_challenge", &code_challenge),
+            ("code_challenge_method", "S256"),
         ],
     );
 
@@ -184,8 +195,9 @@ async fn callback(
 ) -> Response {
     let mut s = session.lock().await;
 
-    // A state is good for one callback, whatever happens next.
+    // A state (and its verifier) is good for one callback, whatever happens next.
     let expected_state = s.state.take();
+    let code_verifier = s.code_verifier.take().unwrap_or_default();
     if expected_state.is_none() || params.get("state") != expected_state.as_ref() {
         println!(
             "State DOES NOT MATCH: expected {expected_state:?} got {:?}",
@@ -217,6 +229,7 @@ async fn callback(
             ("grant_type", "authorization_code"),
             ("code", code),
             ("redirect_uri", CLIENT.redirect_uris[0]),
+            ("code_verifier", &code_verifier),
         ])
         .send()
         .await;
