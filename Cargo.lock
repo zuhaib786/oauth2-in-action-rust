@@ -680,9 +680,12 @@ name = "native-client"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "oauth-common",
  "reqwest",
+ "ring",
  "serde_json",
+ "sha2",
  "tokio",
 ]
 
@@ -726,6 +729,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
+ "jsonwebtoken",
  "minijinja",
  "rand",
  "serde",

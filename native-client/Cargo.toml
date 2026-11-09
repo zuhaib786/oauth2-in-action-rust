@@ -10,3 +10,6 @@ axum.workspace = true
 tokio = { workspace = true, features = ["time"] }
 reqwest.workspace = true
 serde_json.workspace = true
+ring.workspace = true
+base64.workspace = true
+sha2.workspace = true

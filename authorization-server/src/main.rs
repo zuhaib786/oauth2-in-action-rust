@@ -30,8 +30,8 @@ use axum::{
 };
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, jwk::JwkSet};
 use oauth_common::{
-    Db, build_url, build_url_with_fragment, context, decode_client_credentials, param, pkce_challenge, random_string,
-    render,
+    Db, build_url, build_url_with_fragment, context, decode_client_credentials, dpop, param, pkce_challenge,
+    random_string, render,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -416,11 +416,19 @@ struct Grant<'a> {
     client: &'a Client,
     scope: Vec<String>,
     user: Option<String>,
+    /// The thumbprint of the DPoP key the tokens are bound to (RFC 9449).
+    /// `None` for bearer tokens.
+    jkt: Option<String>,
 }
 
 impl<'a> Grant<'a> {
-    fn new(client: &'a Client, scope: Vec<String>, user: Option<String>) -> Self {
-        Grant { id: random_string(32), client, scope, user }
+    fn new(client: &'a Client, scope: Vec<String>, user: Option<String>, jkt: Option<String>) -> Self {
+        Grant { id: random_string(32), client, scope, user, jkt }
+    }
+
+    /// `DPoP` for tokens bound to a key, `Bearer` for the rest.
+    fn token_type(&self) -> &'static str {
+        if self.jkt.is_some() { "DPoP" } else { "Bearer" }
     }
 
     /// Who the token is about: the user's `sub`, or for client credentials
@@ -437,7 +445,7 @@ impl<'a> Grant<'a> {
     fn issue_access_token(&self, db: &Db) -> String {
         let iat = now_secs();
         let jti = random_string(32);
-        let claims = json!({
+        let mut claims = json!({
             "iss": ISSUER,
             "sub": self.subject(),
             "aud": PROTECTED_RESOURCE,
@@ -447,6 +455,10 @@ impl<'a> Grant<'a> {
             "exp": iat + ACCESS_TOKEN_LIFETIME,
             "jti": jti,
         });
+        if let Some(jkt) = &self.jkt {
+            // the confirmation claim: only the holder of this key may use the token (RFC 9449 §6.1)
+            claims["cnf"] = json!({ "jkt": jkt });
+        }
         let mut header = Header::new(Algorithm::RS256);
         header.typ = Some("at+jwt".into());
         header.kid = Some(SIGNING_KEY_ID.clone());
@@ -486,14 +498,19 @@ impl<'a> Grant<'a> {
     }
 
     /// Creates a refresh token and saves it for later refresh_token grants.
+    /// A public client's is bound to its DPoP key, since nothing else ties it
+    /// to the client. A confidential client's is already tied to it by
+    /// client authentication (RFC 9449 §5).
     fn issue_refresh_token(&self, db: &Db) -> String {
         let refresh_token = random_string(32);
+        let jkt = self.jkt.as_ref().filter(|_| self.client.client_secret.is_none());
         db.insert(json!({
             "refresh_token": refresh_token,
             "client_id": self.client.client_id,
             "scope": self.scope,
             "user": self.user,
             "grant_id": self.id,
+            "jkt": jkt,
         }));
         println!("Issuing refresh token {refresh_token}");
         refresh_token
@@ -803,7 +820,7 @@ async fn approve(
         Some(ResponseType::Token) => {
             // The implicit grant: the token goes straight back to the browser,
             // and never with a refresh token (RFC 6749 §4.2.2).
-            let grant = Grant::new(&client, scope, Some(user.preferred_username.clone()));
+            let grant = Grant::new(&client, scope, Some(user.preferred_username.clone()), None);
             let access_token = grant.issue_access_token(&app.db);
             let scope = grant.scope.join(" ");
             redirect_back(
@@ -877,11 +894,20 @@ async fn token(
         return json_error(StatusCode::BAD_REQUEST, "unauthorized_client");
     }
 
+    // DPoP (RFC 9449): with a valid proof, the tokens are bound to its key.
+    let jkt = match dpop::check_request(&headers, "POST", TOKEN_ENDPOINT, None) {
+        Ok(jkt) => jkt,
+        Err(why) => {
+            println!("Bad DPoP proof from {client_id}: {why}");
+            return json_error(StatusCode::BAD_REQUEST, "invalid_dpop_proof");
+        }
+    };
+
     match grant_type {
-        "authorization_code" => authorization_code_grant(&app, &client, &body).await,
-        "refresh_token" => refresh_token_grant(&app, &client, &body),
-        "client_credentials" => client_credentials_grant(&app, &client, &body),
-        "password" => password_grant(&app, &client, &body).await,
+        "authorization_code" => authorization_code_grant(&app, &client, &body, jkt).await,
+        "refresh_token" => refresh_token_grant(&app, &client, &body, jkt),
+        "client_credentials" => client_credentials_grant(&app, &client, &body, jkt),
+        "password" => password_grant(&app, &client, &body, jkt).await,
         _ => unreachable!("checked against TOKEN_GRANT_TYPES"),
     }
 }
@@ -891,6 +917,7 @@ async fn authorization_code_grant(
     app: &AppState,
     client: &Client,
     body: &HashMap<String, String>,
+    jkt: Option<String>,
 ) -> Response {
     let code_value = param(body, "code");
 
@@ -939,14 +966,20 @@ async fn authorization_code_grant(
             return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
         }
 
-        let grant = Grant { id: code.grant_id.clone(), client, scope: code.scope.clone(), user: Some(code.user.clone()) };
+        let grant = Grant {
+            id: code.grant_id.clone(),
+            client,
+            scope: code.scope.clone(),
+            user: Some(code.user.clone()),
+            jkt,
+        };
         (grant, code.request.get("nonce").cloned())
     };
 
     let access_token = grant.issue_access_token(&app.db);
     let refresh_token = grant.issue_refresh_token(&app.db);
     println!("Issued tokens for code {code_value}");
-    let mut response = token_body(&access_token, Some(&refresh_token), &grant.scope);
+    let mut response = token_body(&grant, &access_token, Some(&refresh_token));
     if grant.scope.iter().any(|s| s == "openid") {
         response["id_token"] = json!(grant.issue_id_token(nonce.as_deref()));
     }
@@ -954,15 +987,15 @@ async fn authorization_code_grant(
 }
 
 /// A successful token endpoint response (RFC 6749 §5.1).
-fn token_response(access_token: &str, refresh_token: Option<&str>, scope: &[String]) -> Response {
-    Json(token_body(access_token, refresh_token, scope)).into_response()
+fn token_response(grant: &Grant, access_token: &str, refresh_token: Option<&str>) -> Response {
+    Json(token_body(grant, access_token, refresh_token)).into_response()
 }
 
-fn token_body(access_token: &str, refresh_token: Option<&str>, scope: &[String]) -> Value {
+fn token_body(grant: &Grant, access_token: &str, refresh_token: Option<&str>) -> Value {
     let mut body = json!({
         "access_token": access_token,
-        "token_type": "Bearer",
-        "scope": scope.join(" "),
+        "token_type": grant.token_type(),
+        "scope": grant.scope.join(" "),
     });
     if let Some(refresh_token) = refresh_token {
         body["refresh_token"] = json!(refresh_token);
@@ -994,7 +1027,8 @@ async fn userinfo(State(app): State<AppState>, headers: HeaderMap) -> Response {
     let Some(token) = token else {
         return userinfo_refusal(StatusCode::UNAUTHORIZED, None);
     };
-    let Some(claims) = active_access_token(&app, token) else {
+    // a DPoP-bound token isn't a bearer token (RFC 9449 §7.2), and this endpoint only takes those
+    let Some(claims) = active_access_token(&app, token).filter(|claims| !claims.contains_key("cnf")) else {
         return userinfo_refusal(StatusCode::UNAUTHORIZED, Some("invalid_token"));
     };
 
@@ -1039,6 +1073,7 @@ async fn openid_configuration() -> Response {
         "id_token_signing_alg_values_supported": ["RS256"],
         "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post", "none"],
         "code_challenge_methods_supported": ["S256"],
+        "dpop_signing_alg_values_supported": [dpop::ALGORITHM],
         "claims_supported": ["iss", "sub", "aud", "iat", "exp", "nonce", "name", "preferred_username", "email", "email_verified"],
     }))
     .into_response()
@@ -1077,7 +1112,9 @@ async fn introspect(
     };
     println!("Introspection by {}: active token", resource.resource_id);
     answer.insert("active".into(), json!(true));
-    answer.insert("token_type".into(), json!("Bearer"));
+    // cnf, if there is one, came along with the claims
+    let token_type = if answer.contains_key("cnf") { "DPoP" } else { "Bearer" };
+    answer.insert("token_type".into(), json!(token_type));
     Json(answer).into_response()
 }
 
@@ -1366,7 +1403,7 @@ fn requested_scope(client: &Client, body: &HashMap<String, String>) -> Option<Ve
 
 /// grant_type=refresh_token: trade a refresh token for a new access token,
 /// without bothering the user again.
-fn refresh_token_grant(app: &AppState, client: &Client, body: &HashMap<String, String>) -> Response {
+fn refresh_token_grant(app: &AppState, client: &Client, body: &HashMap<String, String>, jkt: Option<String>) -> Response {
     let refresh_token = param(body, "refresh_token");
 
     let Some(token) = app.db.find_one(|doc| doc["refresh_token"] == refresh_token) else {
@@ -1379,6 +1416,13 @@ fn refresh_token_grant(app: &AppState, client: &Client, body: &HashMap<String, S
         // Someone is using another client's refresh token. Revoke it.
         println!("Invalid client using a refresh token, expected {} got {}", token["client_id"], client.client_id);
         app.db.remove(|doc| doc["refresh_token"] == refresh_token);
+        return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
+    }
+
+    // A bound refresh token needs a proof by its key. Checked before
+    // rotation, so a thief's failed try doesn't use it up.
+    if token["jkt"].as_str().is_some_and(|bound_to| jkt.as_deref() != Some(bound_to)) {
+        println!("Refresh token {refresh_token} is bound to a DPoP key, and this request wasn't signed with it");
         return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
     }
 
@@ -1403,16 +1447,17 @@ fn refresh_token_grant(app: &AppState, client: &Client, body: &HashMap<String, S
         client,
         scope: serde_json::from_value(token["scope"].clone()).unwrap_or_default(),
         user: token["user"].as_str().map(String::from),
+        jkt,
     };
     let access_token = grant.issue_access_token(&app.db);
     let new_refresh_token = grant.issue_refresh_token(&app.db);
     println!("in exchange for refresh token {refresh_token}");
-    token_response(&access_token, Some(&new_refresh_token), &grant.scope)
+    token_response(&grant, &access_token, Some(&new_refresh_token))
 }
 
 /// grant_type=client_credentials: the client gets a token for itself. No
 /// user is involved, so the token has none.
-fn client_credentials_grant(app: &AppState, client: &Client, body: &HashMap<String, String>) -> Response {
+fn client_credentials_grant(app: &AppState, client: &Client, body: &HashMap<String, String>, jkt: Option<String>) -> Response {
     if client.client_secret.is_none() {
         // Anyone can send a public client's id, so it can't get tokens on its own (RFC 6749 §4.4).
         println!("Public client {} tried the client credentials grant", client.client_id);
@@ -1425,15 +1470,15 @@ fn client_credentials_grant(app: &AppState, client: &Client, body: &HashMap<Stri
     };
 
     // No refresh token: the client can just ask again (RFC 6749 §4.4.3).
-    let grant = Grant::new(client, scope, None);
+    let grant = Grant::new(client, scope, None, jkt);
     let access_token = grant.issue_access_token(&app.db);
-    token_response(&access_token, None, &grant.scope)
+    token_response(&grant, &access_token, None)
 }
 
 /// grant_type=password: the client sends the user's own username and
 /// password. Deprecated (RFC 9700 §2.4), and the reason this server has to
 /// handle passwords at all.
-async fn password_grant(app: &AppState, client: &Client, body: &HashMap<String, String>) -> Response {
+async fn password_grant(app: &AppState, client: &Client, body: &HashMap<String, String>, jkt: Option<String>) -> Response {
     let username = param(body, "username");
 
     let Some(scope) = requested_scope(client, body) else {
@@ -1460,10 +1505,10 @@ async fn password_grant(app: &AppState, client: &Client, body: &HashMap<String, 
         return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
     };
 
-    let grant = Grant::new(client, scope, Some(user.preferred_username.clone()));
+    let grant = Grant::new(client, scope, Some(user.preferred_username.clone()), jkt);
     let access_token = grant.issue_access_token(&app.db);
     let refresh_token = client.allows_grant("refresh_token").then(|| grant.issue_refresh_token(&app.db));
-    token_response(&access_token, refresh_token.as_deref(), &grant.scope)
+    token_response(&grant, &access_token, refresh_token.as_deref())
 }
 
 /// A layer that puts `name: value` on every response.

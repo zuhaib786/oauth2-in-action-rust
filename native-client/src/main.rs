@@ -3,7 +3,8 @@
 //! It's a public client, so it has no secret. To get the authorization code
 //! back from the browser, it runs a tiny web server on the loopback address
 //! for as long as the login takes (RFC 8252 §7.3). PKCE (chapter 10) makes
-//! sure only this process can redeem the code.
+//! sure only this process can redeem the code, and DPoP (chapter 15) that
+//! only this process can use the tokens.
 //!
 //! Run it with:  cargo run -p native-client
 
@@ -11,7 +12,7 @@ use std::{
     collections::HashMap,
     process::ExitCode,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -20,8 +21,15 @@ use axum::{
     response::Html,
     routing::get,
 };
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use oauth_common::{build_url, pkce_challenge, random_string};
-use serde_json::Value;
+use reqwest::header::AUTHORIZATION;
+use ring::{
+    rand::SystemRandom,
+    signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair},
+};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::{net::TcpListener, sync::oneshot};
 
 const AUTHORIZATION_ENDPOINT: &str = "http://localhost:9001/authorize";
@@ -76,11 +84,19 @@ async fn run() -> Result<String, Error> {
     }
 
     let code = wait_for_code(listener, state).await?;
-    let access_token = trade_code(&code, &redirect_uri, &code_verifier).await?;
+    let key = DpopKey::generate()?;
+    let (access_token, token_type) = trade_code(&code, &redirect_uri, &code_verifier, &key).await?;
+    println!("Token type: {token_type}");
 
-    let resource: Value = reqwest::Client::new()
-        .post(PROTECTED_RESOURCE)
-        .bearer_auth(access_token)
+    let request = reqwest::Client::new().post(PROTECTED_RESOURCE);
+    // a server without DPoP gives us a plain bearer token
+    let request = if token_type.eq_ignore_ascii_case("dpop") {
+        let proof = key.proof("POST", PROTECTED_RESOURCE, Some(&access_token))?;
+        request.header(AUTHORIZATION, format!("DPoP {access_token}")).header("DPoP", proof)
+    } else {
+        request.bearer_auth(access_token)
+    };
+    let resource: Value = request
         .send()
         .await?
         .error_for_status()?
@@ -162,11 +178,13 @@ fn check_callback(params: &HashMap<String, String>, expected_state: &str) -> Res
 // The token endpoint
 // ---------------------------------------------------------------------------
 
-/// Trades the code for an access token. A public client has no secret, so
-/// it says who it is and proves it started this login with the verifier.
-async fn trade_code(code: &str, redirect_uri: &str, code_verifier: &str) -> Result<String, Error> {
+/// Trades the code for an access token, bound to our key. Returns it with
+/// its type. A public client has no secret, so it says who it is and proves
+/// it started this login with the verifier.
+async fn trade_code(code: &str, redirect_uri: &str, code_verifier: &str, key: &DpopKey) -> Result<(String, String), Error> {
     let res = reqwest::Client::new()
         .post(TOKEN_ENDPOINT)
+        .header("DPoP", key.proof("POST", TOKEN_ENDPOINT, None)?)
         .form(&[
             ("grant_type", "authorization_code"),
             ("code", code),
@@ -182,10 +200,56 @@ async fn trade_code(code: &str, redirect_uri: &str, code_verifier: &str) -> Resu
     if !status.is_success() {
         return Err(format!("the token endpoint answered {status}: {}", body["error"]).into());
     }
-    body["access_token"]
-        .as_str()
-        .map(String::from)
-        .ok_or_else(|| "the token response has no access_token".into())
+    let access_token = body["access_token"].as_str().ok_or("the token response has no access_token")?;
+    let token_type = body["token_type"].as_str().unwrap_or("Bearer");
+    Ok((access_token.to_string(), token_type.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// DPoP
+// ---------------------------------------------------------------------------
+
+/// The key this run's tokens are bound to (RFC 9449). Made fresh every run
+/// and never written down: a stolen token is no use without it.
+struct DpopKey {
+    pair: EcdsaKeyPair,
+    rng: SystemRandom,
+}
+
+impl DpopKey {
+    fn generate() -> Result<Self, Error> {
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
+            .map_err(|_| "couldn't make a key")?;
+        let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng)
+            .map_err(|_| "couldn't read the key back")?;
+        Ok(DpopKey { pair, rng })
+    }
+
+    /// The public half, as a JWK. ring gives it as `0x04`, then `x`, then
+    /// `y`, 32 bytes each.
+    fn jwk(&self) -> Value {
+        let point = self.pair.public_key().as_ref();
+        json!({ "kty": "EC", "crv": "P-256", "x": base64url(&point[1..33]), "y": base64url(&point[33..]) })
+    }
+
+    /// A proof for one `method` request to `url`. At the resource it also
+    /// carries the hash of the access token it comes with.
+    fn proof(&self, method: &str, url: &str, access_token: Option<&str>) -> Result<String, Error> {
+        let header = json!({ "typ": "dpop+jwt", "alg": "ES256", "jwk": self.jwk() });
+        let iat = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let mut claims = json!({ "jti": random_string(32), "htm": method, "htu": url, "iat": iat });
+        if let Some(token) = access_token {
+            claims["ath"] = json!(base64url(&Sha256::digest(token)));
+        }
+        let signing_input = format!("{}.{}", base64url(header.to_string().as_bytes()), base64url(claims.to_string().as_bytes()));
+        let signature = self.pair.sign(&self.rng, signing_input.as_bytes()).map_err(|_| "couldn't sign a proof")?;
+        Ok(format!("{signing_input}.{}", base64url(signature.as_ref())))
+    }
+}
+
+fn base64url(bytes: &[u8]) -> String {
+    URL_SAFE_NO_PAD.encode(bytes)
 }
 
 fn open_browser(url: &str) {

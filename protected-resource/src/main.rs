@@ -15,13 +15,14 @@ use axum::{
     Json, Router,
     extract::{FromRequest, Query, Request, State},
     http::{
-        HeaderMap, HeaderValue, Method, StatusCode,
+        HeaderMap, HeaderName, HeaderValue, Method, StatusCode,
         header::{AUTHORIZATION, CONTENT_TYPE, STRICT_TRANSPORT_SECURITY, WWW_AUTHENTICATE, X_CONTENT_TYPE_OPTIONS},
+        request::Parts,
     },
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use oauth_common::{context, param, parse_form, render};
+use oauth_common::{context, dpop, param, parse_form, render};
 use serde_json::{Map, Value, json};
 use tokio::sync::Mutex;
 use tower_http::{
@@ -31,6 +32,9 @@ use tower_http::{
 
 /// Named in every `WWW-Authenticate` challenge.
 const REALM: &str = "localhost:9002";
+/// Our own address, which DPoP proofs must name in `htu`. Never taken from
+/// the request's `Host` header, which the client controls.
+const BASE_URL: &str = "http://localhost:9002";
 
 /// Where we ask the authorization server about tokens (RFC 7662).
 const INTROSPECTION_ENDPOINT: &str = "http://localhost:9001/introspect";
@@ -47,7 +51,7 @@ fn cors() -> CorsLayer {
     CorsLayer::new()
         .allow_origin(AllowOrigin::list([HeaderValue::from_static(CLIENT_ORIGIN)]))
         .allow_methods([Method::GET, Method::POST, Method::DELETE])
-        .allow_headers([AUTHORIZATION, CONTENT_TYPE])
+        .allow_headers([AUTHORIZATION, CONTENT_TYPE, HeaderName::from_static("dpop")])
         // so a script can see why it was refused
         .expose_headers([WWW_AUTHENTICATE])
         .max_age(Duration::from_secs(600))
@@ -77,51 +81,102 @@ enum Refusal {
     InvalidRequest,
     /// A good token without the scope this needs.
     InsufficientScope(&'static str),
+    /// A DPoP problem (RFC 9449 §7.1): a bad or missing proof, or a token
+    /// that isn't bound to the proof's key. Comes with a `DPoP` challenge.
+    Dpop(&'static str),
 }
 
 impl IntoResponse for Refusal {
     fn into_response(self) -> Response {
-        let (status, error, scope) = match self {
-            Refusal::NoToken => (StatusCode::UNAUTHORIZED, None, None),
-            Refusal::InvalidToken => (StatusCode::UNAUTHORIZED, Some("invalid_token"), None),
-            Refusal::InvalidRequest => (StatusCode::BAD_REQUEST, Some("invalid_request"), None),
-            Refusal::InsufficientScope(scope) => (StatusCode::FORBIDDEN, Some("insufficient_scope"), Some(scope)),
+        let (status, scheme, error, scope) = match self {
+            Refusal::NoToken => (StatusCode::UNAUTHORIZED, "Bearer", None, None),
+            Refusal::InvalidToken => (StatusCode::UNAUTHORIZED, "Bearer", Some("invalid_token"), None),
+            Refusal::InvalidRequest => (StatusCode::BAD_REQUEST, "Bearer", Some("invalid_request"), None),
+            Refusal::InsufficientScope(scope) => {
+                (StatusCode::FORBIDDEN, "Bearer", Some("insufficient_scope"), Some(scope))
+            }
+            Refusal::Dpop(error) => (StatusCode::UNAUTHORIZED, "DPoP", Some(error), None),
         };
-        let mut challenge = format!(r#"Bearer realm="{REALM}""#);
+        let mut challenge = format!(r#"{scheme} realm="{REALM}""#);
         if let Some(error) = error {
             challenge.push_str(&format!(r#", error="{error}""#));
         }
         if let Some(scope) = scope {
             challenge.push_str(&format!(r#", scope="{scope}""#));
         }
+        if scheme == "DPoP" {
+            challenge.push_str(&format!(r#", algs="{}""#, dpop::ALGORITHM));
+        }
         (status, [(WWW_AUTHENTICATE, challenge)]).into_response()
     }
 }
 
-/// Finds the access token in the `Authorization: Bearer` header or the form
-/// body (never the URL: RFC 6750 §2.3), then checks it. Returns its claims.
-async fn get_access_token(app: &AppState, headers: &HeaderMap, form: &HashMap<String, String>) -> Result<Value, Refusal> {
-    let from_header = headers
+/// How the client sent its token.
+enum Scheme {
+    /// Whoever holds it may use it (RFC 6750).
+    Bearer,
+    /// With a proof that the client holds the key the token is bound to (RFC 9449).
+    Dpop,
+}
+
+/// Finds the access token in the `Authorization` header (`Bearer` or `DPoP`)
+/// or the form body (never the URL: RFC 6750 §2.3), then checks it. Returns
+/// its claims.
+async fn get_access_token(app: &AppState, request: &Parts, form: &HashMap<String, String>) -> Result<Value, Refusal> {
+    let from_header = request
+        .headers
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|auth| auth.split_once(' '))
-        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
-        .map(|(_, token)| token.trim().to_string());
+        .and_then(|(scheme, token)| {
+            let scheme = match scheme.to_ascii_lowercase().as_str() {
+                "bearer" => Scheme::Bearer,
+                "dpop" => Scheme::Dpop,
+                _ => return None,
+            };
+            Some((scheme, token.trim().to_string()))
+        });
 
-    let in_token = match (from_header, form.get("access_token")) {
+    let (scheme, in_token) = match (from_header, form.get("access_token")) {
         // "Clients MUST NOT use more than one method" (RFC 6750 §2)
         (Some(_), Some(_)) => return Err(Refusal::InvalidRequest),
-        (Some(token), None) => token,
-        (None, Some(token)) => token.clone(),
+        (Some(found), None) => found,
+        (None, Some(token)) => (Scheme::Bearer, token.clone()),
         (None, None) => return Err(Refusal::NoToken),
     };
 
-    let claims = introspect(&app.http, &in_token).await;
-    match &claims {
-        Some(claims) => println!("Accepted a token for {}", claims["sub"]),
-        None => println!("Refused token {in_token}"),
+    // A DPoP token comes with a proof for this request and this token.
+    let proof_key = match scheme {
+        Scheme::Bearer => None,
+        Scheme::Dpop => {
+            let url = format!("{BASE_URL}{}", request.uri.path());
+            match dpop::check_request(&request.headers, request.method.as_str(), &url, Some(&in_token)) {
+                Ok(Some(jkt)) => Some(jkt),
+                Ok(None) => {
+                    println!("A DPoP token without a proof");
+                    return Err(Refusal::Dpop("invalid_dpop_proof"));
+                }
+                Err(why) => {
+                    println!("Bad DPoP proof: {why}");
+                    return Err(Refusal::Dpop("invalid_dpop_proof"));
+                }
+            }
+        }
+    };
+
+    let Some(claims) = introspect(&app.http, &in_token).await else {
+        println!("Refused token {in_token}");
+        return Err(if proof_key.is_some() { Refusal::Dpop("invalid_token") } else { Refusal::InvalidToken });
+    };
+    // A bound token needs a proof by its key, so it can't be used as a
+    // bearer token (RFC 9449 §7.2). An unbound one can't be used as DPoP.
+    let bound_to = claims.get("cnf").and_then(|cnf| cnf.get("jkt")).and_then(Value::as_str);
+    if bound_to != proof_key.as_deref() {
+        println!("Refused token {in_token}: bound to {bound_to:?}, but the request proved {proof_key:?}");
+        return Err(Refusal::Dpop("invalid_token"));
     }
-    claims.map(Value::Object).ok_or(Refusal::InvalidToken)
+    println!("Accepted a token for {}", claims["sub"]);
+    Ok(Value::Object(claims))
 }
 
 /// Asks the authorization server about a token. Gives its claims if it's
@@ -195,7 +250,7 @@ impl FromRequest<AppState> for AccessToken {
             HashMap::new()
         };
 
-        let claims = get_access_token(state, &parts.headers, &form).await?;
+        let claims = get_access_token(state, &parts, &form).await?;
         Ok(AccessToken { claims, form })
     }
 }
