@@ -97,26 +97,5 @@ fn r4_signed_tokens_still_need_good_claims() {
     }
 }
 
-// HS256 only lasts until 11-3, which replaces these two tests.
-
-#[test]
-fn r1_tokens_are_signed_with_hs256() {
-    let token = access_token("foo", "alice");
-    let (header, _) = jwt_parts(&token);
-    assert_eq!(header["alg"], "HS256");
-    assert_eq!(header["typ"], "at+jwt");
-
-    let (signing_input, signature) = token.rsplit_once('.').unwrap();
-    assert_eq!(signature, hs_signature("HS256", SHARED_SECRET, signing_input), "signed with the shared secret");
-}
-
-#[test]
-fn r5_whoever_has_the_secret_can_mint_tokens() {
-    let mut claims = good_claims();
-    claims["aud"] = json!([format!("{RS_URL}/"), "http://localhost:9999/"]);
-    let minted = hs_jwt(&json!({ "alg": "HS256", "typ": "at+jwt" }), &claims, SHARED_SECRET);
-
-    let favorites = http().get(format!("{RS_URL}/favorites")).bearer_auth(&minted).call();
-    favorites.assert_status(200);
-    assert_eq!(favorites.json()["user"], "Bob");
-}
+// r1_tokens_are_signed_with_hs256 and r5_whoever_has_the_secret_can_mint_tokens
+// lived here. 11-3 moved to RS256: see ch11_ex3.rs.
