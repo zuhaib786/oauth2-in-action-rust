@@ -14,10 +14,12 @@
 
 use std::{
     collections::HashMap,
-    path::PathBuf,
-    process::Command,
-    sync::{Mutex, MutexGuard},
-    time::{SystemTime, UNIX_EPOCH},
+    io::{BufRead, BufReader, Read},
+    path::{Path, PathBuf},
+    process::{Child, Command, ExitStatus, Stdio},
+    sync::{Arc, Mutex, MutexGuard, mpsc},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use reqwest::{
@@ -418,4 +420,101 @@ pub fn build_bin(package: &str) -> PathBuf {
 pub fn unique(prefix: &str) -> String {
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
     format!("{prefix}{nanos}")
+}
+
+/// A program running in the background, whose stdout the test reads line by
+/// line while it runs.
+pub struct Running {
+    child: Child,
+    lines: mpsc::Receiver<String>,
+    seen: Vec<String>,
+    stderr: Arc<Mutex<String>>,
+}
+
+impl Running {
+    /// Starts `program` with `NO_BROWSER=1` set, so it doesn't open a browser.
+    pub fn start(program: &Path, args: &[&str]) -> Running {
+        let mut child = Command::new(program)
+            .args(args)
+            .env("NO_BROWSER", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| panic!("cannot start {}: {e}", program.display()));
+
+        let (send, lines) = mpsc::channel();
+        let stdout = child.stdout.take().expect("piped stdout");
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if send.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let stderr = Arc::new(Mutex::new(String::new()));
+        let mut pipe = child.stderr.take().expect("piped stderr");
+        let sink = Arc::clone(&stderr);
+        thread::spawn(move || {
+            let mut text = String::new();
+            let _ = pipe.read_to_string(&mut text);
+            sink.lock().unwrap_or_else(|p| p.into_inner()).push_str(&text);
+        });
+
+        Running { child, lines, seen: Vec::new(), stderr }
+    }
+
+    /// Waits for a line of stdout that `wanted` accepts and returns it.
+    #[track_caller]
+    pub fn wait_for_line(&mut self, what: &str, wanted: impl Fn(&str) -> bool) -> String {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match self.lines.recv_timeout(left) {
+                Ok(line) => {
+                    self.seen.push(line.clone());
+                    if wanted(&line) {
+                        return line;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = self.child.kill();
+        panic!("the program never printed {what}.\nstdout so far:\n{}\nstderr:\n{}", self.seen.join("\n"), self.stderr());
+    }
+
+    /// Waits for the program to exit and returns its exit status and all of
+    /// its stdout.
+    #[track_caller]
+    pub fn wait_for_exit(mut self) -> (ExitStatus, String) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            if let Some(status) = self.child.try_wait().expect("check on the program") {
+                break status;
+            }
+            if Instant::now() > deadline {
+                let _ = self.child.kill();
+                panic!("the program didn't exit within 20 s.\nstdout:\n{}", self.seen.join("\n"));
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+        // the reader thread ends when the pipe closes
+        while let Ok(line) = self.lines.recv_timeout(Duration::from_secs(2)) {
+            self.seen.push(line);
+        }
+        (status, self.seen.join("\n"))
+    }
+
+    /// Everything the program wrote to stderr so far (all of it once it has exited).
+    pub fn stderr(&self) -> String {
+        thread::sleep(Duration::from_millis(100));
+        self.stderr.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+    }
 }
