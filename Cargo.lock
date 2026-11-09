@@ -9,6 +9,7 @@ dependencies = [
  "base64 0.22.1",
  "jsonwebtoken",
  "reqwest",
+ "ring",
  "serde_json",
  "sha2",
  "url",
