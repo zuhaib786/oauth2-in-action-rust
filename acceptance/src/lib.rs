@@ -339,6 +339,82 @@ pub fn hs_jwt(header: &Value, claims: &Value, secret: &[u8]) -> String {
     format!("{signing_input}.{}", hs_signature(alg, secret, signing_input))
 }
 
+// ---------------------------------------------------------------------------
+// DPoP (chapter 15)
+// ---------------------------------------------------------------------------
+
+/// A client's DPoP key: a fresh P-256 key pair (RFC 9449).
+pub struct DpopKey {
+    pair: ring::signature::EcdsaKeyPair,
+    x: String,
+    y: String,
+}
+
+impl DpopKey {
+    pub fn generate() -> Self {
+        use ring::{
+            rand::SystemRandom,
+            signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair},
+        };
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+        let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng).unwrap();
+        // an uncompressed point: 0x04, then x and y, 32 bytes each
+        let public = pair.public_key().as_ref().to_vec();
+        DpopKey { pair, x: b64url(&public[1..33]), y: b64url(&public[33..65]) }
+    }
+
+    /// The public key as a JWK.
+    pub fn jwk(&self) -> Value {
+        json!({ "kty": "EC", "crv": "P-256", "x": self.x, "y": self.y })
+    }
+
+    /// The RFC 7638 thumbprint of the public key: what a bound token's
+    /// `cnf.jkt` holds.
+    pub fn thumbprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let canonical = format!(r#"{{"crv":"P-256","kty":"EC","x":"{}","y":"{}"}}"#, self.x, self.y);
+        b64url(&Sha256::digest(canonical.as_bytes()))
+    }
+
+    /// A JWT with this header and these claims, signed with this key (ES256),
+    /// whatever the header says.
+    pub fn sign(&self, header: &Value, claims: &Value) -> String {
+        let signing_input = format!("{}.{}", b64url(header.to_string().as_bytes()), b64url(claims.to_string().as_bytes()));
+        let signature = self.pair.sign(&ring::rand::SystemRandom::new(), signing_input.as_bytes()).unwrap();
+        format!("{signing_input}.{}", b64url(signature.as_ref()))
+    }
+
+    /// The header of a good proof: `typ` `dpop+jwt`, ES256, and our public key.
+    pub fn proof_header(&self) -> Value {
+        json!({ "typ": "dpop+jwt", "alg": "ES256", "jwk": self.jwk() })
+    }
+
+    /// A good proof for one request (RFC 9449 §4.2): a fresh `jti`, `iat`
+    /// now, and with an access token, its hash as `ath`.
+    pub fn proof(&self, htm: &str, htu: &str, access_token: Option<&str>) -> String {
+        use sha2::{Digest, Sha256};
+        let mut claims = json!({ "jti": random_id(), "htm": htm, "htu": htu, "iat": now_secs() });
+        if let Some(token) = access_token {
+            claims["ath"] = json!(b64url(&Sha256::digest(token.as_bytes())));
+        }
+        self.sign(&self.proof_header(), &claims)
+    }
+}
+
+/// 128 random bits, base64url: a `jti` no other test will also pick.
+pub fn random_id() -> String {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let mut bytes = [0u8; 16];
+    SystemRandom::new().fill(&mut bytes).unwrap();
+    b64url(&bytes)
+}
+
+fn b64url(bytes: &[u8]) -> String {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
 /// `POST /token` authenticated as oauth-client-1 with HTTP Basic.
 pub fn token_request(form: &[(&str, &str)]) -> Reply {
     token_request_as(CLIENT_ID, CLIENT_SECRET, form)
