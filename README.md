@@ -43,10 +43,15 @@ builds are fast. Stop a program with Ctrl-C, and restart it after you change its
 
 Every exercise is two git tags:
 
-- `chX-exY-start` is the code with the exercise's parts replaced by `TODO` comments.
-- `chX-exY-done` is the solution.
+- `chX-exY-start` is where you begin.
+- `chX-exY-done` is the reference solution.
 
-The `main` branch is the latest finished code.
+The `main` branch is the latest finished code. Chapters 3–5 and chapters 6
+onwards work a little differently.
+
+### Chapters 3–5: fill in the TODOs
+
+At `chX-exY-start`, the exercise's parts of the code are replaced by `TODO` comments.
 
 ```sh
 # 1. Start an exercise on your own branch
@@ -81,7 +86,33 @@ version came out different, that's fine: your branch still has it.
 "solution" opens GitHub's diff view, so you see exactly what the exercise
 changes and nothing else. Don't open it before you've tried!
 
-Later chapters will be added the same way.
+### Chapter 6 onwards: a spec and tests, no skeleton
+
+From chapter 6 there are no `TODO`s. Each exercise gives you two things:
+
+- **`exercises/chX-exY.md`**, the spec: what to build, as numbered
+  requirements, with the RFC sections they come from.
+- **`acceptance/tests/chX_exY.rs`**, tests that check those requirements by
+  talking to the running servers over HTTP, the way a browser or curl would.
+  They only look at what your servers answer, so the code inside is entirely
+  up to you: where it goes, what it's called, which crates you add.
+
+```sh
+git switch -c my-ch6-ex1 ch6-ex1-start
+cat exercises/ch6-ex1.md
+
+# write the code, (re)start the three servers, then:
+cargo test -p acceptance --test ch6_ex1    # this exercise's tests
+cargo test -p acceptance                   # everything so far, to check nothing broke
+
+git diff ch6-ex1-done                      # compare with the reference solution
+```
+
+The tests need the servers running and fail with a clear message if they
+aren't. Restart a server after you change its code: the tests talk to whatever
+is running. The helpers they use are in `acceptance/src/lib.rs`, and you're
+welcome to add tests of your own. Some requirements can't be checked from the
+outside (how you store passwords, say). The spec marks those "not tested".
 
 ### One reader's solutions
 
@@ -101,6 +132,8 @@ protected-resource/     the protected API (port 9002)
   src/main.rs           the code
   templates/*.html      the web pages (from the book, using Jinja syntax)
 common/                 small helpers shared by all three (see below)
+acceptance/             black-box tests that run against the three servers
+exercises/              the specs for chapter 6 onwards
 database.jsonl          tokens issued by the authorization server and read by the
                         protected resource (created when the server starts)
 ```
