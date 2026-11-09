@@ -107,17 +107,5 @@ fn r3_only_the_servers_keys() {
     assert_refused(&rs256_jwt(None, &good_claims()), "no kid");
 }
 
-// What self-contained tokens can't do. 11-4 replaces this test.
-#[test]
-fn r5_a_revoked_token_still_works() {
-    let redeem = |code: &str| {
-        token_request(&[("grant_type", "authorization_code"), ("code", code), ("redirect_uri", REDIRECT_URI)])
-    };
-    let code = get_code("foo", "alice");
-    let first = redeem(&code);
-    first.assert_status(200);
-    redeem(&code).assert_status(400);
-
-    let access_token = first.json()["access_token"].as_str().unwrap().to_string();
-    get_resource(&access_token).assert_status(200);
-}
+// r5_a_revoked_token_still_works lived here. 11-4 added introspection, and
+// turned it around: see r5_the_resource_refuses_revoked_tokens in ch11_ex4.rs.
