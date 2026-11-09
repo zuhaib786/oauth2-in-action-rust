@@ -14,14 +14,20 @@ use std::{
 use axum::{
     Json, Router,
     extract::{FromRequest, Query, Request, State},
-    http::{HeaderMap, StatusCode, header::WWW_AUTHENTICATE},
-    response::{Html, IntoResponse, Response},
+    http::{
+        HeaderMap, HeaderValue, Method, StatusCode,
+        header::{AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE, X_CONTENT_TYPE_OPTIONS},
+    },
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use oauth_common::{Db, context, param, parse_form, render};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
-use tower_http::cors::CorsLayer;
+use tower_http::{cors::CorsLayer, set_header::SetResponseHeaderLayer};
+
+/// Named in every `WWW-Authenticate` challenge.
+const REALM: &str = "localhost:9002";
 
 #[derive(Clone)]
 struct AppState {
@@ -35,36 +41,75 @@ struct AppState {
 // Finding and checking the access token
 // ---------------------------------------------------------------------------
 
-/// Looks for an access token in (1) the `Authorization: Bearer` header,
-/// (2) the form body, or (3) the query string, then checks it against the
-/// database the authorization server writes to. Returns the stored token
-/// record (with its `client_id`, `scope`, ...) if it is valid.
-fn get_access_token(
-    db: &Db,
-    headers: &HeaderMap,
-    query: &HashMap<String, String>,
-    form: &HashMap<String, String>,
-) -> Option<Value> {
-    let auth = headers.get("authorization").and_then(|v| v.to_str().ok());
+/// Why a request was turned away. Each kind answers with its own status and
+/// `WWW-Authenticate` challenge (RFC 6750 §3), so the client can tell them apart.
+#[derive(Debug)]
+enum Refusal {
+    /// No token at all. The challenge carries no error code (RFC 6750 §3.1).
+    NoToken,
+    /// A token we don't recognise.
+    InvalidToken,
+    /// A malformed request, like a token sent two ways at once.
+    InvalidRequest,
+    /// A good token without the scope this needs.
+    InsufficientScope(&'static str),
+}
 
-    let in_token = if let Some(auth) = auth.filter(|a| a.to_lowercase().starts_with("bearer ")) {
-        Some(auth["bearer ".len()..].to_string())
-    } else if let Some(token) = form.get("access_token") {
-        // not in the header, check in the form body
-        Some(token.clone())
-    } else {
-        query.get("access_token").cloned()
+impl IntoResponse for Refusal {
+    fn into_response(self) -> Response {
+        let (status, error, scope) = match self {
+            Refusal::NoToken => (StatusCode::UNAUTHORIZED, None, None),
+            Refusal::InvalidToken => (StatusCode::UNAUTHORIZED, Some("invalid_token"), None),
+            Refusal::InvalidRequest => (StatusCode::BAD_REQUEST, Some("invalid_request"), None),
+            Refusal::InsufficientScope(scope) => (StatusCode::FORBIDDEN, Some("insufficient_scope"), Some(scope)),
+        };
+        let mut challenge = format!(r#"Bearer realm="{REALM}""#);
+        if let Some(error) = error {
+            challenge.push_str(&format!(r#", error="{error}""#));
+        }
+        if let Some(scope) = scope {
+            challenge.push_str(&format!(r#", scope="{scope}""#));
+        }
+        (status, [(WWW_AUTHENTICATE, challenge)]).into_response()
+    }
+}
+
+/// Finds the access token in the `Authorization: Bearer` header or the form
+/// body (never the URL: RFC 6750 §2.3), then checks it against the database
+/// the authorization server writes to. Returns the stored token record (with
+/// its `client_id`, `scope`, ...).
+fn get_access_token(db: &Db, headers: &HeaderMap, form: &HashMap<String, String>) -> Result<Value, Refusal> {
+    let from_header = headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|auth| auth.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, token)| token.trim().to_string());
+
+    let in_token = match (from_header, form.get("access_token")) {
+        // "Clients MUST NOT use more than one method" (RFC 6750 §2)
+        (Some(_), Some(_)) => return Err(Refusal::InvalidRequest),
+        (Some(token), None) => token,
+        (None, Some(token)) => token.clone(),
+        (None, None) => return Err(Refusal::NoToken),
     };
-
-    println!("Incoming token: {}", in_token.as_deref().unwrap_or("(none)"));
-    let in_token = in_token?;
 
     let found = db.find_one(|doc| doc["access_token"] == in_token.as_str());
     match &found {
         Some(_) => println!("We found a matching token: {in_token}"),
         None => println!("No matching token was found."),
     }
-    found
+    found.ok_or(Refusal::InvalidToken)
+}
+
+/// Is this body a form we may look for a token in? (RFC 6750 §2.2)
+fn has_form_body(method: &Method, headers: &HeaderMap) -> bool {
+    let is_form = headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|content_type| content_type.split(';').next())
+        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/x-www-form-urlencoded"));
+    is_form && method != Method::GET
 }
 
 /// A valid access token that came with the request.
@@ -93,20 +138,19 @@ impl AccessToken {
 
 /// This is the code that runs when a handler asks for an `AccessToken`.
 impl FromRequest<AppState> for AccessToken {
-    type Rejection = StatusCode;
+    type Rejection = Refusal;
 
     async fn from_request(req: Request, state: &AppState) -> Result<Self, Self::Rejection> {
         let (parts, body) = req.into_parts();
-        let query = parse_form(parts.uri.query().unwrap_or(""));
-        let body = axum::body::to_bytes(body, 64 * 1024)
-            .await
-            .map_err(|_| StatusCode::BAD_REQUEST)?;
-        let form = parse_form(&String::from_utf8_lossy(&body));
+        let form = if has_form_body(&parts.method, &parts.headers) {
+            let body = axum::body::to_bytes(body, 64 * 1024).await.map_err(|_| Refusal::InvalidRequest)?;
+            parse_form(&String::from_utf8_lossy(&body))
+        } else {
+            HashMap::new()
+        };
 
-        match get_access_token(&state.db, &parts.headers, &query, &form) {
-            Some(record) => Ok(AccessToken { record, form }),
-            None => Err(StatusCode::UNAUTHORIZED),
-        }
+        let record = get_access_token(&state.db, &parts.headers, &form)?;
+        Ok(AccessToken { record, form })
     }
 }
 
@@ -128,10 +172,8 @@ fn now_millis() -> u64 {
 }
 
 /// 403 Forbidden, telling the client which scope it was missing.
-fn insufficient_scope(scope: &str) -> Response {
-    let challenge =
-        format!(r#"Bearer realm=localhost:9002, error="insufficient_scope", scope="{scope}""#);
-    (StatusCode::FORBIDDEN, [(WWW_AUTHENTICATE, challenge)]).into_response()
+fn insufficient_scope(scope: &'static str) -> Response {
+    Refusal::InsufficientScope(scope).into_response()
 }
 
 async fn get_words(State(app): State<AppState>, token: AccessToken) -> Response {
@@ -201,19 +243,17 @@ async fn favorites(token: AccessToken) -> Response {
 // ---------------------------------------------------------------------------
 
 /// Greets you in the language you ask for: `/helloWorld?language=en`.
-///
-/// Written the way the book first writes it. Exercise 8-1 is about what's
-/// wrong with it.
+/// Always JSON, and never repeats what it was sent.
 async fn hello_world(Query(query): Query<HashMap<String, String>>, _token: AccessToken) -> Response {
     let greeting = match param(&query, "language") {
-        "en" => "Hello World".to_string(),
-        "de" => "Hallo Welt".to_string(),
-        "it" => "Ciao Mondo".to_string(),
-        "fr" => "Bonjour monde".to_string(),
-        "es" => "Hola mundo".to_string(),
-        other => format!("Error, invalid language: {other}"),
+        "en" => "Hello World",
+        "de" => "Hallo Welt",
+        "it" => "Ciao Mondo",
+        "fr" => "Bonjour monde",
+        "es" => "Hola mundo",
+        _ => return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid_language" }))).into_response(),
     };
-    Html(greeting).into_response()
+    Json(json!({ "greeting": greeting })).into_response()
 }
 
 #[tokio::main]
@@ -230,6 +270,8 @@ async fn main() {
         .route("/favorites", get(favorites))
         .route("/helloWorld", get(hello_world))
         .layer(CorsLayer::permissive()) // `app.use(cors())`
+        // Browsers must not guess that a JSON answer is really HTML.
+        .layer(SetResponseHeaderLayer::overriding(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff")))
         .with_state(state);
 
     oauth_common::serve(app, 9002, "OAuth Resource Server").await;
