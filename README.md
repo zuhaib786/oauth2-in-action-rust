@@ -117,6 +117,7 @@ outside (how you store passwords, say). The spec marks those "not tested".
 | Book exercise | Tag prefix | What you build | Spec | Browse |
 |---|---|---|---|---|
 | 6-1 | `ch6-ex1` | Authorization server: the implicit grant, public clients, grant types per client | [spec](exercises/ch6-ex1.md) | [start](https://github.com/zuhaib786/oauth2-in-action-rust/tree/ch6-ex1-start) · [solution](https://github.com/zuhaib786/oauth2-in-action-rust/compare/ch6-ex1-start...ch6-ex1-done) |
+| 6-2 | `ch6-ex2` | Authorization server: the client credentials grant. A `word-bot` CLI that uses it | [spec](exercises/ch6-ex2.md) | [start](https://github.com/zuhaib786/oauth2-in-action-rust/tree/ch6-ex2-start) · [solution](https://github.com/zuhaib786/oauth2-in-action-rust/compare/ch6-ex2-start...ch6-ex2-done) |
 
 ### One reader's solutions
 
