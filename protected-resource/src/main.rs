@@ -175,12 +175,6 @@ async fn delete_word(State(app): State<AppState>, token: AccessToken) -> Respons
 }
 
 async fn produce(token: AccessToken) -> Response {
-    let produce = json!({
-        "fruit": ["apple", "banana", "kiwi"],
-        "veggies": ["lettuce", "onion", "potato"],
-        "meats": ["bacon", "steak", "chicken breast"],
-    });
-
     /*
      * TODO: Add different kinds of produce based on the incoming token's scope
      *
@@ -191,7 +185,18 @@ async fn produce(token: AccessToken) -> Response {
      *         produce["fruit"] = json!(["apple", "banana", "kiwi"]);
      *     (the variable has to be `let mut` for that)
      */
+    let all_produce = json!({
+        "fruit": ["apple", "banana", "kiwi"],
+        "veggies": ["lettuce", "onion", "potato"],
+        "meats": ["bacon", "steak", "chicken breast"],
+    });
 
+    let mut produce = json!({"fruit": [],"veggies": [], "meats": []});
+    for scope in ["fruit", "veggies", "meats"] {
+        if token.has_scope(scope) {
+            produce[scope] = all_produce[scope].clone();
+        }
+    }
     Json(produce).into_response()
 }
 
