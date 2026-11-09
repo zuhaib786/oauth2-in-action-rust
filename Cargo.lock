@@ -1161,6 +1161,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
+name = "word-bot"
+version = "0.1.0"
+dependencies = [
+ "oauth-common",
+ "reqwest",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "writeable"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
