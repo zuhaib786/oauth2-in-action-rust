@@ -358,8 +358,15 @@ pub fn client_app_lock() -> MutexGuard<'static, ()> {
 /// unless `scopes` says otherwise. Returns the client's answer to `/callback`.
 #[track_caller]
 pub fn client_login(browser: &Client, user: &str, scopes: Option<&[&str]>) -> Reply {
-    let start = browser.get(format!("{CLIENT_URL}/authorize")).call();
-    let to_as = start.location().to_string();
+    let callback = client_start_login(browser, user, scopes);
+    browser.get(callback).call()
+}
+
+/// The first half of [`client_login`]: returns the `/callback` URL the
+/// authorization server sends the browser to, without visiting it.
+#[track_caller]
+pub fn client_start_login(browser: &Client, user: &str, scopes: Option<&[&str]>) -> String {
+    let to_as = client_authorize_url(browser);
     let page = browser.get(&to_as).call();
     assert_eq!(page.status, StatusCode::OK, "expected the approval page at {to_as}:\n{}", page.body);
     let offered = scopes_on_page(&page.body);
@@ -367,8 +374,14 @@ pub fn client_login(browser: &Client, user: &str, scopes: Option<&[&str]>) -> Re
         Some(s) => s.to_vec(),
         None => offered.iter().map(String::as_str).collect(),
     };
-    let back = approve(&reqid(&page.body), user, &ticked);
-    browser.get(back.location()).call()
+    approve(&reqid(&page.body), user, &ticked).location().to_string()
+}
+
+/// Visits the client app's `/authorize` and returns where it sends the
+/// browser (the authorization server's `/authorize`, with parameters).
+#[track_caller]
+pub fn client_authorize_url(browser: &Client) -> String {
+    browser.get(format!("{CLIENT_URL}/authorize")).call().location().to_string()
 }
 
 /// The access token the client app's home page shows, or `None` for "NONE".
