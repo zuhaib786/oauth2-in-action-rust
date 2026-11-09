@@ -2,7 +2,8 @@
 //!
 //! It's a public client, so it has no secret. To get the authorization code
 //! back from the browser, it runs a tiny web server on the loopback address
-//! for as long as the login takes (RFC 8252 §7.3).
+//! for as long as the login takes (RFC 8252 §7.3). PKCE (chapter 10) makes
+//! sure only this process can redeem the code.
 //!
 //! Run it with:  cargo run -p native-client
 
@@ -19,7 +20,7 @@ use axum::{
     response::Html,
     routing::get,
 };
-use oauth_common::{build_url, random_string};
+use oauth_common::{build_url, pkce_challenge, random_string};
 use serde_json::Value;
 use tokio::{net::TcpListener, sync::oneshot};
 
@@ -54,6 +55,7 @@ async fn run() -> Result<String, Error> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let redirect_uri = format!("http://127.0.0.1:{}/callback", listener.local_addr()?.port());
     let state = random_string(32);
+    let code_verifier = random_string(64);
 
     let authorize_url = build_url(
         AUTHORIZATION_ENDPOINT,
@@ -63,6 +65,8 @@ async fn run() -> Result<String, Error> {
             ("redirect_uri", &redirect_uri),
             ("scope", SCOPE),
             ("state", &state),
+            ("code_challenge", &pkce_challenge(&code_verifier)),
+            ("code_challenge_method", "S256"),
         ],
     );
     println!("Open this URL in your browser to log in:");
@@ -72,7 +76,7 @@ async fn run() -> Result<String, Error> {
     }
 
     let code = wait_for_code(listener, state).await?;
-    let access_token = trade_code(&code, &redirect_uri).await?;
+    let access_token = trade_code(&code, &redirect_uri, &code_verifier).await?;
 
     let resource: Value = reqwest::Client::new()
         .post(PROTECTED_RESOURCE)
@@ -159,8 +163,8 @@ fn check_callback(params: &HashMap<String, String>, expected_state: &str) -> Res
 // ---------------------------------------------------------------------------
 
 /// Trades the code for an access token. A public client has no secret, so
-/// it just says who it is.
-async fn trade_code(code: &str, redirect_uri: &str) -> Result<String, Error> {
+/// it says who it is and proves it started this login with the verifier.
+async fn trade_code(code: &str, redirect_uri: &str, code_verifier: &str) -> Result<String, Error> {
     let res = reqwest::Client::new()
         .post(TOKEN_ENDPOINT)
         .form(&[
@@ -168,6 +172,7 @@ async fn trade_code(code: &str, redirect_uri: &str) -> Result<String, Error> {
             ("code", code),
             ("redirect_uri", redirect_uri),
             ("client_id", CLIENT_ID),
+            ("code_verifier", code_verifier),
         ])
         .send()
         .await?;

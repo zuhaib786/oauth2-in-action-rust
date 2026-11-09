@@ -25,7 +25,8 @@ use axum::{
     routing::{get, post},
 };
 use oauth_common::{
-    Db, build_url, build_url_with_fragment, context, decode_client_credentials, param, random_string, render,
+    Db, build_url, build_url_with_fragment, context, decode_client_credentials, param, pkce_challenge, random_string,
+    render,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -425,6 +426,17 @@ fn single_valued(pairs: Vec<(String, String)>) -> Option<HashMap<String, String>
     Some(params)
 }
 
+/// What S256 produces: 43 characters of base64url.
+fn is_valid_challenge(challenge: &str) -> bool {
+    challenge.len() == 43 && challenge.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// 43 to 128 characters of `A-Z a-z 0-9 - . _ ~` (RFC 7636 §4.1).
+fn is_valid_verifier(verifier: &str) -> bool {
+    (43..=128).contains(&verifier.len())
+        && verifier.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._~".contains(&b))
+}
+
 /// The error page, for errors we can't send back to the client.
 fn error_page(error: &str) -> Response {
     let mut page = render("error", context! { error => error });
@@ -493,6 +505,20 @@ async fn authorize(
         // whatever the client registered (RFC 9700 §4.11.2).
         println!("Client {client_id} asked for scopes it may not have: {rscope:?}");
         return error_page("Invalid scope");
+    }
+
+    // PKCE (RFC 7636): only S256, and required from public clients (RFC 9700 §2.1.1).
+    if response_type == ResponseType::Code {
+        let pkce = (query.get("code_challenge"), query.get("code_challenge_method").map(String::as_str));
+        let pkce_ok = match pkce {
+            (Some(challenge), Some("S256")) => is_valid_challenge(challenge),
+            (None, None) => client.client_secret.is_some(),
+            _ => false,
+        };
+        if !pkce_ok {
+            println!("Bad or missing PKCE from {client_id}: {pkce:?}");
+            return redirect_back(&query, Some(response_type), &[("error", "invalid_request")]);
+        }
     }
 
     let reqid = random_string(32);
@@ -678,6 +704,19 @@ async fn authorization_code_grant(
         // The redirect URI the code was sent to must be repeated here (RFC 6749 §4.1.3).
         if code.request.get("redirect_uri").is_some_and(|sent_to| body.get("redirect_uri") != Some(sent_to)) {
             println!("Redirect URI mismatch for code {code_value}");
+            return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
+        }
+
+        // PKCE: the verifier must hash to the challenge the code was issued for.
+        let pkce_ok = match (code.request.get("code_challenge"), body.get("code_verifier")) {
+            (Some(challenge), Some(verifier)) => is_valid_verifier(verifier) && pkce_challenge(verifier) == *challenge,
+            (None, None) => true,
+            // A verifier for a code issued without a challenge means someone
+            // stripped the challenge out on the way (RFC 9700 §4.8.2).
+            _ => false,
+        };
+        if !pkce_ok {
+            println!("PKCE verification failed for code {code_value}");
             return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
         }
 

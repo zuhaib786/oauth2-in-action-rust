@@ -16,6 +16,7 @@
 //! | `qs.parse(body)`                | [`parse_form`]                          |
 //! | `req.query.x` / `req.body.x`    | [`param`]`(&query, "x")`                |
 //! | `app.listen(port, ...)`         | [`serve`]                               |
+//! | PKCE's S256 (chapter 10)        | [`pkce_challenge`]                      |
 
 use std::{
     collections::HashMap,
@@ -30,9 +31,13 @@ use axum::{
     http::StatusCode,
     response::{Html, IntoResponse, Response},
 };
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD},
+};
 use rand::{Rng, distr::Alphanumeric};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 // Re-exported so exercises can write `context! { key => value }` without
 // adding minijinja to their own Cargo.toml.
@@ -97,6 +102,16 @@ fn build(base: &str, params: &[(&str, &str)], fragment: Option<&str>) -> String 
         url.set_fragment(fragment);
     }
     url.to_string()
+}
+
+// ---------------------------------------------------------------------------
+// PKCE
+// ---------------------------------------------------------------------------
+
+/// The PKCE code challenge for a code verifier, with the S256 method:
+/// BASE64URL(SHA256(verifier)), no padding (RFC 7636 §4.2).
+pub fn pkce_challenge(verifier: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
 
 // ---------------------------------------------------------------------------
@@ -350,6 +365,15 @@ mod tests {
         assert_eq!(
             build_url_with_fragment("http://localhost:9000/cb", &[], "access_token=abc"),
             "http://localhost:9000/cb#access_token=abc"
+        );
+    }
+
+    #[test]
+    fn pkce_matches_the_rfc_example() {
+        // RFC 7636, Appendix B
+        assert_eq!(
+            pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
         );
     }
 
