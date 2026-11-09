@@ -11,8 +11,6 @@
 
 // Silences "unused variable/import" warnings until you've written your code.
 // Delete this line when you're done, to see if anything is left unused.
-#![allow(unused)]
-
 use std::collections::HashMap;
 
 use axum::{
@@ -53,7 +51,30 @@ fn get_access_token(
      *   - println! what you find; the logs help a lot when debugging
      */
 
-    None
+    let access_token = match get_header(headers, "authorization") {
+        Some(s) => {
+            if s.to_lowercase().starts_with("bearer ") {
+                &s[7..]
+            } else {
+                return None;
+            }
+        }
+        None => {
+            if let Some(token) = form.get("access_token") {
+                token
+            } else if let Some(token) = query.get("access_token") {
+                token
+            } else {
+                return None;
+            }
+        }
+    };
+    println!("Found access_token: {}", access_token);
+    db.find_one(|doc| doc["access_token"] == access_token)
+}
+
+fn get_header<'a>(headers: &'a HeaderMap, header: &str) -> Option<&'a str> {
+    headers.get(header).and_then(|v| v.to_str().ok())
 }
 
 async fn resource(
@@ -68,6 +89,10 @@ async fn resource(
      * TODO: Call get_access_token. Only send the resource if a valid token
      * was found. Otherwise answer with StatusCode::UNAUTHORIZED.into_response()
      */
+    let access_token = get_access_token(&db, &headers, &query, &form);
+    if access_token.is_none() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
 
     Json(json!({
         "name": "Protected Resource",
