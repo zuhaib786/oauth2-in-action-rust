@@ -71,6 +71,11 @@ fn r7_r8_deny_puts_the_error_and_state_in_the_fragment() {
 #[test]
 fn r6_r7_invalid_scope_goes_in_the_fragment() {
     let reply = authorize(&implicit_request("foo write"));
+    if !reply.is_redirect() {
+        // From 9-2 on, the server shows an error page here instead.
+        reply.assert_status(400);
+        return;
+    }
     let response = fragment_params(reply.location());
     assert_eq!(response.get("error").map(String::as_str), Some("invalid_scope"));
     assert_eq!(response.get("state").map(String::as_str), Some("st-123"));
