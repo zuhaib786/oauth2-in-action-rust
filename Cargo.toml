@@ -2,7 +2,7 @@
 # All crates share a single `target/` dir, so dependencies compile only once.
 [workspace]
 resolver = "2"
-members = ["common", "client", "authorization-server", "protected-resource", "acceptance"]
+members = ["common", "client", "authorization-server", "protected-resource", "word-bot", "acceptance"]
 
 [workspace.dependencies]
 oauth-common = { path = "common" }

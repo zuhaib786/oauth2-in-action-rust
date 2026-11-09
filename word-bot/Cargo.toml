@@ -1,0 +1,11 @@
+[package]
+name = "word-bot"
+version = "0.1.0"
+edition = "2024"
+description = "Adds words to the Words API using the client credentials grant (chapter 6)"
+
+[dependencies]
+oauth-common.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

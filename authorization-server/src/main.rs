@@ -68,6 +68,13 @@ static CLIENTS: LazyLock<Vec<Client>> = LazyLock::new(|| {
             scope: "foo bar".into(),
             grant_types: vec!["implicit".into()],
         },
+        Client {
+            client_id: "oauth-client-service".into(),
+            client_secret: Some("oauth-client-secret-service".into()),
+            redirect_uris: vec![],
+            scope: "read write".into(),
+            grant_types: vec!["client_credentials".into()],
+        },
     ]
 });
 
@@ -103,7 +110,7 @@ impl ResponseType {
 }
 
 /// The grant types the token endpoint knows.
-const TOKEN_GRANT_TYPES: &[&str] = &["authorization_code", "refresh_token"];
+const TOKEN_GRANT_TYPES: &[&str] = &["authorization_code", "refresh_token", "client_credentials"];
 
 // ---------------------------------------------------------------------------
 // Users (resource owners)
@@ -429,6 +436,7 @@ async fn token(
     match grant_type {
         "authorization_code" => authorization_code_grant(&app, client, &body).await,
         "refresh_token" => refresh_token_grant(&app, client, &body),
+        "client_credentials" => client_credentials_grant(&app, client, &body),
         _ => unreachable!("checked against TOKEN_GRANT_TYPES"),
     }
 }
@@ -506,6 +514,35 @@ fn refresh_token_grant(app: &AppState, client: &Client, body: &HashMap<String, S
         "token_type": "Bearer",
         "refresh_token": refresh_token,
         "scope": scope_to_string(&token["scope"]),
+    }))
+    .into_response()
+}
+
+/// grant_type=client_credentials: the client gets a token for itself. No
+/// user is involved, so the token has none.
+fn client_credentials_grant(app: &AppState, client: &Client, body: &HashMap<String, String>) -> Response {
+    if client.client_secret.is_none() {
+        // Anyone can send a public client's id, so it can't get tokens on its own (RFC 6749 §4.4).
+        println!("Public client {} tried the client credentials grant", client.client_id);
+        return json_error(StatusCode::BAD_REQUEST, "unauthorized_client");
+    }
+
+    let cscope = split_scope(&client.scope);
+    let scope = match body.get("scope") {
+        Some(requested) => split_scope(requested),
+        None => cscope.clone(),
+    };
+    if has_extra_scope(&scope, &cscope) {
+        println!("Client {} asked for scopes it may not have: {scope:?}", client.client_id);
+        return json_error(StatusCode::BAD_REQUEST, "invalid_scope");
+    }
+
+    // No refresh token: the client can just ask again (RFC 6749 §4.4.3).
+    let access_token = issue_access_token(&app.db, client, &scope, None);
+    Json(json!({
+        "access_token": access_token,
+        "token_type": "Bearer",
+        "scope": scope.join(" "),
     }))
     .into_response()
 }
