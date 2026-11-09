@@ -23,8 +23,9 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
 };
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, jwk::JwkSet};
 use oauth_common::{build_url, context, encode_client_credentials, param, pkce_challenge, random_string, render};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tokio::sync::Mutex;
 use tower_http::set_header::SetResponseHeaderLayer;
 
@@ -34,6 +35,9 @@ struct AuthServer {
     token_endpoint: &'static str,
     revocation_endpoint: &'static str,
     registration_endpoint: &'static str,
+    userinfo_endpoint: &'static str,
+    jwks_uri: &'static str,
+    issuer: &'static str,
 }
 
 const AUTH_SERVER: AuthServer = AuthServer {
@@ -41,6 +45,9 @@ const AUTH_SERVER: AuthServer = AuthServer {
     token_endpoint: "http://localhost:9001/token",
     revocation_endpoint: "http://localhost:9001/revoke",
     registration_endpoint: "http://localhost:9001/register",
+    userinfo_endpoint: "http://localhost:9001/userinfo",
+    jwks_uri: "http://localhost:9001/jwks",
+    issuer: "http://localhost:9001/",
 };
 
 // client information: what we tell the authorization server when we register
@@ -54,7 +61,7 @@ struct ClientInfo {
 const CLIENT: ClientInfo = ClientInfo {
     client_name: "OAuth in Action web client",
     redirect_uris: &["http://localhost:9000/callback"],
-    scope: "foo bar read write delete fruit veggies meats movies foods music",
+    scope: "openid profile email foo bar read write delete fruit veggies meats movies foods music",
 };
 
 /// What the authorization server gave us when we registered (RFC 7591).
@@ -123,6 +130,10 @@ struct ClientState {
     state: Option<String>,
     /// That login's PKCE code verifier (chapter 10).
     code_verifier: Option<String>,
+    /// That login's OpenID Connect nonce (chapter 13).
+    nonce: Option<String>,
+    /// Who logged in, as UserInfo names them.
+    user: Option<String>,
     access_token: Option<String>,
     scope: Option<String>,
     refresh_token: Option<String>,
@@ -199,7 +210,7 @@ fn error_page(error: &str) -> Response {
 fn show_tokens(s: &ClientState) -> Response {
     render(
         "index",
-        context! { access_token => s.access_token, scope => s.scope, refresh_token => s.refresh_token },
+        context! { access_token => s.access_token, scope => s.scope, refresh_token => s.refresh_token, user => s.user },
     )
 }
 
@@ -224,6 +235,11 @@ async fn authorize(Extension(session): Extension<Session>) -> Response {
     let code_challenge = pkce_challenge(&code_verifier);
     s.code_verifier = Some(code_verifier);
 
+    // OpenID Connect: the ID token has to come back with this.
+    let nonce = random_string(32);
+    s.nonce = Some(nonce.clone());
+    s.user = None;
+
     let authorize_url = build_url(
         AUTH_SERVER.authorization_endpoint,
         &[
@@ -234,6 +250,7 @@ async fn authorize(Extension(session): Extension<Session>) -> Response {
             ("state", &state),
             ("code_challenge", &code_challenge),
             ("code_challenge_method", "S256"),
+            ("nonce", &nonce),
         ],
     );
 
@@ -250,6 +267,7 @@ async fn callback(
     // A state (and its verifier) is good for one callback, whatever happens next.
     let expected_state = s.state.take();
     let code_verifier = s.code_verifier.take().unwrap_or_default();
+    let nonce = s.nonce.take();
     if expected_state.is_none() || params.get("state") != expected_state.as_ref() {
         println!("State DOES NOT MATCH: expected {expected_state:?} got {:?}", params.get("state"));
         return error_page("State value did not match");
@@ -295,6 +313,19 @@ async fn callback(
     }
 
     let body: Value = tok_res.json().await.unwrap_or_default();
+
+    // Who logged in? Only an ID token addressed to us, for this login, says so.
+    let mut user = None;
+    if let Some(id_token) = body["id_token"].as_str() {
+        let claims = match validate_id_token(id_token, &registration.client_id, nonce.as_deref()).await {
+            Ok(claims) => claims,
+            Err(err) => return error_page(&format!("Invalid ID token: {err}")),
+        };
+        let sub = claims.get("sub").and_then(Value::as_str).unwrap_or_default();
+        user = Some(user_name(body["access_token"].as_str().unwrap_or_default(), sub).await);
+        println!("Logged in as {user:?}");
+    }
+    s.user = user;
 
     s.access_token = body["access_token"].as_str().map(String::from);
     println!("Got access token: {:?}", s.access_token);
@@ -342,6 +373,46 @@ async fn fetch_resource(Extension(session): Extension<Session>) -> Response {
             }
         }
         Err(err) => render("error", context! { error => format!("Resource request failed: {err}") }),
+    }
+}
+
+/// Checks an ID token (OpenID Connect Core §3.1.3.7) and returns its claims:
+/// signed by the server's key with RS256, from the server, for us, not
+/// expired, and carrying the nonce this login sent.
+async fn validate_id_token(id_token: &str, client_id: &str, nonce: Option<&str>) -> Result<Map<String, Value>, String> {
+    let header = jsonwebtoken::decode_header(id_token).map_err(|e| e.to_string())?;
+    let kid = header.kid.ok_or("no kid")?;
+    let jwks: JwkSet = async { reqwest::get(AUTH_SERVER.jwks_uri).await?.error_for_status()?.json().await }
+        .await
+        .map_err(|e: reqwest::Error| format!("couldn't fetch the server's keys: {e}"))?;
+    let jwk = jwks.find(&kid).ok_or("signed with a key the server doesn't publish")?;
+    let key = DecodingKey::from_jwk(jwk).map_err(|e| e.to_string())?;
+
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.set_issuer(&[AUTH_SERVER.issuer]);
+    validation.set_audience(&[client_id]);
+    validation.set_required_spec_claims(&["iss", "sub", "aud", "exp", "iat"]);
+    let claims = jsonwebtoken::decode::<Map<String, Value>>(id_token, &key, &validation)
+        .map_err(|e| e.to_string())?
+        .claims;
+
+    if nonce.is_none() || claims.get("nonce").and_then(Value::as_str) != nonce {
+        return Err("the nonce doesn't match this login".into());
+    }
+    Ok(claims)
+}
+
+/// The user's name from UserInfo, or their `sub` if UserInfo won't say, or
+/// says it about someone else (OpenID Connect Core §5.3.2).
+async fn user_name(access_token: &str, sub: &str) -> String {
+    let info: Option<Value> = async {
+        let res = reqwest::Client::new().get(AUTH_SERVER.userinfo_endpoint).bearer_auth(access_token).send().await.ok()?;
+        res.error_for_status().ok()?.json().await.ok()
+    }
+    .await;
+    match info {
+        Some(info) if info["sub"] == sub => info["name"].as_str().unwrap_or(sub).to_string(),
+        _ => sub.to_string(),
     }
 }
 

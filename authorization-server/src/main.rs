@@ -43,6 +43,10 @@ use url::{Host, Url};
 const AUTHORIZATION_ENDPOINT: &str = "http://localhost:9001/authorize";
 const TOKEN_ENDPOINT: &str = "http://localhost:9001/token";
 const REGISTRATION_ENDPOINT: &str = "http://localhost:9001/register";
+const USERINFO_ENDPOINT: &str = "http://localhost:9001/userinfo";
+const JWKS_URI: &str = "http://localhost:9001/jwks";
+const INTROSPECTION_ENDPOINT: &str = "http://localhost:9001/introspect";
+const REVOCATION_ENDPOINT: &str = "http://localhost:9001/revoke";
 
 /// The `iss` of every token we issue.
 const ISSUER: &str = "http://localhost:9001/";
@@ -194,7 +198,7 @@ fn built_in_clients() -> Vec<Client> {
             client_secret: Some("oauth-client-secret-1".into()),
             token_endpoint_auth_method: AuthMethod::Basic,
             redirect_uris: vec!["http://localhost:9000/callback".into()],
-            scope: "foo bar read write delete fruit veggies meats movies foods music".into(),
+            scope: "foo bar read write delete fruit veggies meats movies foods music openid profile email".into(),
             grant_types: vec!["authorization_code".into(), "refresh_token".into()],
             client_name: None,
             client_uri: None,
@@ -458,6 +462,29 @@ impl<'a> Grant<'a> {
         access_token
     }
 
+    /// An OpenID Connect ID token (Core §2): who logged in, for which client.
+    /// `None` without a user.
+    fn issue_id_token(&self, nonce: Option<&str>) -> Option<String> {
+        let user = get_user(self.user.as_deref()?)?;
+        let iat = now_secs();
+        let mut claims = json!({
+            "iss": ISSUER,
+            "sub": user.sub,
+            "aud": self.client.client_id,
+            "iat": iat,
+            "exp": iat + ACCESS_TOKEN_LIFETIME,
+        });
+        if let Some(nonce) = nonce {
+            claims["nonce"] = json!(nonce);
+        }
+        // typ JWT, not at+jwt: nobody may take this for an access token
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(SIGNING_KEY_ID.clone());
+        let id_token = jsonwebtoken::encode(&header, &claims, &SIGNING_KEY).expect("signing with RS256 doesn't fail");
+        println!("Issuing ID token for {}", user.sub);
+        Some(id_token)
+    }
+
     /// Creates a refresh token and saves it for later refresh_token grants.
     fn issue_refresh_token(&self, db: &Db) -> String {
         let refresh_token = random_string(32);
@@ -491,6 +518,13 @@ fn verify_access_token(token: &str) -> Option<Map<String, Value>> {
     validation.validate_aud = false;
     validation.set_required_spec_claims(&["exp", "iss", "aud", "jti"]);
     jsonwebtoken::decode(token, &VERIFYING_KEY, &validation).ok().map(|token| token.claims)
+}
+
+/// The claims of one of our access tokens if it's active: signed, unexpired,
+/// and not revoked (revoked tokens' records are gone).
+fn active_access_token(app: &AppState, token: &str) -> Option<Map<String, Value>> {
+    verify_access_token(token)
+        .filter(|claims| claims.get("jti").is_some_and(|jti| app.db.find_one(|doc| doc["jti"] == *jti).is_some()))
 }
 
 /// Deletes every token issued under a grant.
@@ -860,7 +894,7 @@ async fn authorization_code_grant(
 ) -> Response {
     let code_value = param(body, "code");
 
-    let grant = {
+    let (grant, nonce) = {
         let mut state = app.inner.lock().await;
         let Some(code) = state.codes.get_mut(code_value) else {
             println!("Unknown code, {code_value}");
@@ -905,17 +939,26 @@ async fn authorization_code_grant(
             return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
         }
 
-        Grant { id: code.grant_id.clone(), client, scope: code.scope.clone(), user: Some(code.user.clone()) }
+        let grant = Grant { id: code.grant_id.clone(), client, scope: code.scope.clone(), user: Some(code.user.clone()) };
+        (grant, code.request.get("nonce").cloned())
     };
 
     let access_token = grant.issue_access_token(&app.db);
     let refresh_token = grant.issue_refresh_token(&app.db);
     println!("Issued tokens for code {code_value}");
-    token_response(&access_token, Some(&refresh_token), &grant.scope)
+    let mut response = token_body(&access_token, Some(&refresh_token), &grant.scope);
+    if grant.scope.iter().any(|s| s == "openid") {
+        response["id_token"] = json!(grant.issue_id_token(nonce.as_deref()));
+    }
+    Json(response).into_response()
 }
 
 /// A successful token endpoint response (RFC 6749 §5.1).
 fn token_response(access_token: &str, refresh_token: Option<&str>, scope: &[String]) -> Response {
+    Json(token_body(access_token, refresh_token, scope)).into_response()
+}
+
+fn token_body(access_token: &str, refresh_token: Option<&str>, scope: &[String]) -> Value {
     let mut body = json!({
         "access_token": access_token,
         "token_type": "Bearer",
@@ -924,12 +967,83 @@ fn token_response(access_token: &str, refresh_token: Option<&str>, scope: &[Stri
     if let Some(refresh_token) = refresh_token {
         body["refresh_token"] = json!(refresh_token);
     }
-    Json(body).into_response()
+    body
 }
 
-/// The scopes a grant without a user's approval page gets: the requested
-/// ones if they're all allowed, every allowed one if none were requested,
-/// or `None` if the client asked for one it may not have.
+/// A `WWW-Authenticate: Bearer` refusal from /userinfo (RFC 6750 §3).
+fn userinfo_refusal(status: StatusCode, error: Option<&str>) -> Response {
+    let mut challenge = r#"Bearer realm="userinfo""#.to_string();
+    if let Some(error) = error {
+        challenge.push_str(&format!(r#", error="{error}""#));
+    }
+    if status == StatusCode::FORBIDDEN {
+        challenge.push_str(r#", scope="openid""#);
+    }
+    (status, [(WWW_AUTHENTICATE, challenge)]).into_response()
+}
+
+/// `GET` or `POST /userinfo` (OpenID Connect Core §5.3): the user's claims,
+/// as far as the token's scopes allow.
+async fn userinfo(State(app): State<AppState>, headers: HeaderMap) -> Response {
+    let token = headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|auth| auth.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, token)| token.trim());
+    let Some(token) = token else {
+        return userinfo_refusal(StatusCode::UNAUTHORIZED, None);
+    };
+    let Some(claims) = active_access_token(&app, token) else {
+        return userinfo_refusal(StatusCode::UNAUTHORIZED, Some("invalid_token"));
+    };
+
+    let scopes = split_scope(claims.get("scope").and_then(Value::as_str).unwrap_or_default());
+    let has = |scope: &str| scopes.iter().any(|s| s == scope);
+    if !has("openid") {
+        return userinfo_refusal(StatusCode::FORBIDDEN, Some("insufficient_scope"));
+    }
+    let sub = claims.get("sub").and_then(Value::as_str).unwrap_or_default();
+    let Some(user) = USERS.iter().find(|user| user.sub == sub) else {
+        // client credentials: there's no user to describe
+        return userinfo_refusal(StatusCode::UNAUTHORIZED, Some("invalid_token"));
+    };
+
+    let mut info = json!({ "sub": user.sub });
+    if has("profile") {
+        info["name"] = json!(user.name);
+        info["preferred_username"] = json!(user.preferred_username);
+    }
+    if has("email") {
+        info["email"] = json!(user.email);
+        info["email_verified"] = json!(user.email_verified);
+    }
+    Json(info).into_response()
+}
+
+/// `/.well-known/openid-configuration` (OpenID Connect Discovery §3).
+async fn openid_configuration() -> Response {
+    Json(json!({
+        "issuer": ISSUER,
+        "authorization_endpoint": AUTHORIZATION_ENDPOINT,
+        "token_endpoint": TOKEN_ENDPOINT,
+        "userinfo_endpoint": USERINFO_ENDPOINT,
+        "jwks_uri": JWKS_URI,
+        "registration_endpoint": REGISTRATION_ENDPOINT,
+        "introspection_endpoint": INTROSPECTION_ENDPOINT,
+        "revocation_endpoint": REVOCATION_ENDPOINT,
+        "scopes_supported": KNOWN_SCOPES,
+        "response_types_supported": ["code", "token"],
+        "grant_types_supported": ["authorization_code", "implicit", "refresh_token", "client_credentials", "password"],
+        "subject_types_supported": ["public"],
+        "id_token_signing_alg_values_supported": ["RS256"],
+        "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post", "none"],
+        "code_challenge_methods_supported": ["S256"],
+        "claims_supported": ["iss", "sub", "aud", "iat", "exp", "nonce", "name", "preferred_username", "email", "email_verified"],
+    }))
+    .into_response()
+}
+
 /// `POST /introspect` (RFC 7662): tells a protected resource whether a token
 /// is active, and what it's good for.
 async fn introspect(
@@ -954,11 +1068,8 @@ async fn introspect(
             .into_response();
     };
 
-    let token = param(&body, "token");
-    let active = verify_access_token(token)
-        .filter(|claims| claims.get("aud").and_then(Value::as_str) == Some(resource.audience))
-        // revoked tokens' records are gone
-        .filter(|claims| claims.get("jti").is_some_and(|jti| app.db.find_one(|doc| doc["jti"] == *jti).is_some()));
+    let active = active_access_token(&app, param(&body, "token"))
+        .filter(|claims| claims.get("aud").and_then(Value::as_str) == Some(resource.audience));
 
     let Some(mut answer) = active else {
         println!("Introspection by {}: inactive token", resource.resource_id);
@@ -1021,7 +1132,10 @@ async fn revoke(
 const REGISTRABLE_GRANT_TYPES: &[&str] = &["authorization_code", "refresh_token", "client_credentials"];
 
 /// Every scope a client can register for.
-const KNOWN_SCOPES: &[&str] = &["foo", "bar", "read", "write", "delete", "fruit", "veggies", "meats", "movies", "foods", "music"];
+const KNOWN_SCOPES: &[&str] = &[
+    "foo", "bar", "read", "write", "delete", "fruit", "veggies", "meats", "movies", "foods", "music", "openid", "profile",
+    "email",
+];
 
 /// What a client may send to /register (RFC 7591 §2). Other fields are
 /// ignored. A field of the wrong type fails the whole parse.
@@ -1236,6 +1350,9 @@ async fn delete_registration(State(app): State<AppState>, Path(client_id): Path<
     StatusCode::NO_CONTENT.into_response()
 }
 
+/// The scopes a grant without a user's approval page gets: the requested
+/// ones if they're all allowed, every allowed one if none were requested,
+/// or `None` if the client asked for one it may not have.
 fn requested_scope(client: &Client, body: &HashMap<String, String>) -> Option<Vec<String>> {
     let cscope = split_scope(&client.scope);
     match body.get("scope") {
@@ -1381,6 +1498,8 @@ async fn main() {
     let app = Router::new()
         .route("/", get(index))
         .route("/jwks", get(|| async { ([(CONTENT_TYPE, "application/jwk-set+json")], JWKS) }))
+        .route("/.well-known/openid-configuration", get(openid_configuration))
+        .route("/userinfo", get(userinfo).post(userinfo))
         .route("/authorize", get(authorize))
         .route("/approve", post(approve))
         .merge(token_endpoint)

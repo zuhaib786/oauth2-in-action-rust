@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block content %}
       <div class="jumbotron">
+        {% if user %}<p>Logged in as {{ user }}</p>{% endif %}
         <p>Access token value: <span class="label label-danger">{{ access_token or "NONE" }}</span></p>
         <p>Scope value: <span class="label label-danger">{{ scope or "NONE" }}</span></p>
         <p>Refresh token value: <span class="label label-danger">{{ refresh_token or "NONE" }}</span></p>
