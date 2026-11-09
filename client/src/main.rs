@@ -33,29 +33,81 @@ struct AuthServer {
     authorization_endpoint: &'static str,
     token_endpoint: &'static str,
     revocation_endpoint: &'static str,
+    registration_endpoint: &'static str,
 }
 
 const AUTH_SERVER: AuthServer = AuthServer {
     authorization_endpoint: "http://localhost:9001/authorize",
     token_endpoint: "http://localhost:9001/token",
     revocation_endpoint: "http://localhost:9001/revoke",
+    registration_endpoint: "http://localhost:9001/register",
 };
 
-// client information
+// client information: what we tell the authorization server when we register
 struct ClientInfo {
-    client_id: &'static str,
-    client_secret: &'static str,
+    client_name: &'static str,
     redirect_uris: &'static [&'static str],
     /// The scopes we ask for, separated by spaces.
     scope: &'static str,
 }
 
 const CLIENT: ClientInfo = ClientInfo {
-    client_id: "oauth-client-1",
-    client_secret: "oauth-client-secret-1",
+    client_name: "OAuth in Action web client",
     redirect_uris: &["http://localhost:9000/callback"],
     scope: "foo bar read write delete fruit veggies meats movies foods music",
 };
+
+/// What the authorization server gave us when we registered (RFC 7591).
+#[derive(Clone)]
+struct Registration {
+    client_id: String,
+    client_secret: String,
+}
+
+impl Registration {
+    /// Our `Authorization: Basic ...` header value.
+    fn basic_auth(&self) -> String {
+        format!("Basic {}", encode_client_credentials(&self.client_id, &self.client_secret))
+    }
+}
+
+/// Our registration, once we have one. Behind a lock so that two logins
+/// starting at once register only once.
+static REGISTRATION: Mutex<Option<Registration>> = Mutex::const_new(None);
+
+/// Our registration, registering first if we haven't yet.
+async fn registration() -> Result<Registration, String> {
+    let mut registration = REGISTRATION.lock().await;
+    if let Some(registration) = &*registration {
+        return Ok(registration.clone());
+    }
+
+    let metadata = json!({
+        "client_name": CLIENT.client_name,
+        "redirect_uris": CLIENT.redirect_uris,
+        "scope": CLIENT.scope,
+        "grant_types": ["authorization_code", "refresh_token"],
+        "token_endpoint_auth_method": "client_secret_basic",
+    });
+    let res = reqwest::Client::new()
+        .post(AUTH_SERVER.registration_endpoint)
+        .json(&metadata)
+        .send()
+        .await
+        .map_err(|err| format!("Registration failed: {err}"))?;
+    if !res.status().is_success() {
+        return Err(format!("Registration failed: {}", res.status()));
+    }
+    let body: Value = res.json().await.map_err(|err| format!("Registration failed: {err}"))?;
+    let (Some(client_id), Some(client_secret)) = (body["client_id"].as_str(), body["client_secret"].as_str()) else {
+        return Err(format!("Registration answer without credentials: {body}"));
+    };
+
+    println!("Registered as client {client_id}");
+    let new = Registration { client_id: client_id.into(), client_secret: client_secret.into() };
+    *registration = Some(new.clone());
+    Ok(new)
+}
 
 const PROTECTED_RESOURCE: &str = "http://localhost:9002/resource";
 const WORDS_API: &str = "http://localhost:9002/words";
@@ -156,6 +208,10 @@ async fn index(Extension(session): Extension<Session>) -> Response {
 }
 
 async fn authorize(Extension(session): Extension<Session>) -> Response {
+    let registration = match registration().await {
+        Ok(registration) => registration,
+        Err(err) => return error_page(&err),
+    };
     let mut s = session.lock().await;
     s.access_token = None;
     s.scope = None;
@@ -173,7 +229,7 @@ async fn authorize(Extension(session): Extension<Session>) -> Response {
         &[
             ("response_type", "code"),
             ("scope", CLIENT.scope),
-            ("client_id", CLIENT.client_id),
+            ("client_id", &registration.client_id),
             ("redirect_uri", CLIENT.redirect_uris[0]),
             ("state", &state),
             ("code_challenge", &code_challenge),
@@ -207,13 +263,14 @@ async fn callback(
     let code = params.get("code").map(String::as_str).unwrap_or("");
 
     println!("Requesting access token for code {code}");
+    let registration = match registration().await {
+        Ok(registration) => registration,
+        Err(err) => return error_page(&err),
+    };
 
     let tok_res = reqwest::Client::new()
         .post(AUTH_SERVER.token_endpoint)
-        .header(
-            "Authorization",
-            format!("Basic {}", encode_client_credentials(CLIENT.client_id, CLIENT.client_secret)),
-        )
+        .header("Authorization", registration.basic_auth())
         // `.form(...)` sends the body as application/x-www-form-urlencoded
         .form(&[
             ("grant_type", "authorization_code"),
@@ -288,20 +345,19 @@ async fn fetch_resource(Extension(session): Extension<Session>) -> Response {
     }
 }
 
-/// Trades our refresh token for a new access token, then sends the browser
-/// back to /fetch_resource to try again.
 /// Tells the authorization server we're done with our tokens (RFC 7009), then
 /// forgets them.
 async fn revoke(Extension(session): Extension<Session>) -> Response {
+    let registration = match registration().await {
+        Ok(registration) => registration,
+        Err(err) => return error_page(&err),
+    };
     let mut s = session.lock().await;
     // the refresh token first: it takes its whole grant with it
     for token in [s.refresh_token.take(), s.access_token.take()].into_iter().flatten() {
         let answer = reqwest::Client::new()
             .post(AUTH_SERVER.revocation_endpoint)
-            .header(
-                "Authorization",
-                format!("Basic {}", encode_client_credentials(CLIENT.client_id, CLIENT.client_secret)),
-            )
+            .header("Authorization", registration.basic_auth())
             .form(&[("token", token.as_str())])
             .send()
             .await;
@@ -315,16 +371,16 @@ async fn revoke(Extension(session): Extension<Session>) -> Response {
     Redirect::to("/").into_response()
 }
 
-async fn refresh_access_token(s: &mut ClientState) -> Response {
-    let refresh_token = s.refresh_token.clone().unwrap_or_default();
+/// Trades our refresh token for new tokens. The server rotates refresh
+/// tokens (11-5), so the new one replaces the old.
+async fn refresh_tokens(s: &mut ClientState) -> Result<(), String> {
+    let registration = registration().await?;
+    let refresh_token = s.refresh_token.clone().ok_or("No refresh token")?;
     println!("Refreshing token {refresh_token}");
 
     let tok_res = reqwest::Client::new()
         .post(AUTH_SERVER.token_endpoint)
-        .header(
-            "Authorization",
-            format!("Basic {}", encode_client_credentials(CLIENT.client_id, CLIENT.client_secret)),
-        )
+        .header("Authorization", registration.basic_auth())
         .form(&[("grant_type", "refresh_token"), ("refresh_token", refresh_token.as_str())])
         .send()
         .await;
@@ -343,16 +399,32 @@ async fn refresh_access_token(s: &mut ClientState) -> Response {
 
             s.scope = body["scope"].as_str().map(String::from);
             println!("Got scope: {:?}", s.scope);
-
-            // try again
-            Redirect::to("/fetch_resource").into_response()
+            Ok(())
         }
         _ => {
-            println!("No refresh token, asking the user to get a new access token");
-            // tell the user to get a new access token
+            println!("Couldn't refresh, asking the user to get a new access token");
+            s.access_token = None;
             s.refresh_token = None;
-            render("error", context! { error => "Unable to refresh token." })
+            Err("Unable to refresh token.".into())
         }
+    }
+}
+
+/// Refreshes after the resource refused our access token, then sends the
+/// browser back to /fetch_resource to try again.
+async fn refresh_access_token(s: &mut ClientState) -> Response {
+    match refresh_tokens(s).await {
+        Ok(()) => Redirect::to("/fetch_resource").into_response(),
+        Err(err) => error_page(&err),
+    }
+}
+
+/// The Refresh button: new tokens now.
+async fn refresh(Extension(session): Extension<Session>) -> Response {
+    let mut s = session.lock().await;
+    match refresh_tokens(&mut s).await {
+        Ok(()) => Redirect::to("/").into_response(),
+        Err(err) => error_page(&err),
     }
 }
 
@@ -480,6 +552,7 @@ async fn main() {
         .route("/authorize", get(authorize))
         .route("/callback", get(callback))
         .route("/fetch_resource", get(fetch_resource))
+        .route("/refresh", post(refresh))
         .route("/revoke", post(revoke))
         .route("/words", get(words))
         .route("/get_words", get(get_words))

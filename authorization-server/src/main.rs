@@ -9,13 +9,14 @@
 use std::{
     collections::HashMap,
     net::{Ipv4Addr, Ipv6Addr},
-    sync::{Arc, LazyLock},
+    sync::{Arc, LazyLock, PoisonError, RwLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::{
     Form, Json, Router,
+    body::Bytes,
     extract::{Query, State},
     http::{
         HeaderMap, HeaderName, HeaderValue, StatusCode,
@@ -32,7 +33,7 @@ use oauth_common::{
     Db, build_url, build_url_with_fragment, context, decode_client_credentials, param, pkce_challenge, random_string,
     render,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::sync::Mutex;
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -101,17 +102,39 @@ const PROTECTED_RESOURCES: &[ProtectedResource] = &[
 // Registered clients
 // ---------------------------------------------------------------------------
 
+/// How a client proves who it is at the token endpoint (RFC 7591 §2).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+enum AuthMethod {
+    /// The secret in HTTP Basic.
+    #[serde(rename = "client_secret_basic")]
+    Basic,
+    /// The secret in the form body.
+    #[serde(rename = "client_secret_post")]
+    Post,
+    /// A public client: it has no secret, only its `client_id`.
+    #[serde(rename = "none")]
+    Public,
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct Client {
     client_id: String,
     /// `None` for a public client: one that can't keep a secret, like an app
-    /// running in a browser.
+    /// running in a browser. Never serialized, so it can't end up in a page.
+    #[serde(skip)]
     client_secret: Option<String>,
+    token_endpoint_auth_method: AuthMethod,
     redirect_uris: Vec<String>,
     /// The scopes this client may ask for, separated by spaces.
     scope: String,
     /// The grant types this client may use (RFC 7591 §2).
     grant_types: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logo_uri: Option<String>,
 }
 
 impl Client {
@@ -151,48 +174,79 @@ fn is_loopback_ip(url: &Url) -> bool {
     }
 }
 
-static CLIENTS: LazyLock<Vec<Client>> = LazyLock::new(|| {
+/// The clients in the source. More can register at /register.
+fn built_in_clients() -> Vec<Client> {
     vec![
         Client {
             client_id: "oauth-client-1".into(),
             client_secret: Some("oauth-client-secret-1".into()),
+            token_endpoint_auth_method: AuthMethod::Basic,
             redirect_uris: vec!["http://localhost:9000/callback".into()],
             scope: "foo bar read write delete fruit veggies meats movies foods music".into(),
             grant_types: vec!["authorization_code".into(), "refresh_token".into()],
+            client_name: None,
+            client_uri: None,
+            logo_uri: None,
         },
         Client {
             client_id: "oauth-client-implicit".into(),
             client_secret: None,
+            token_endpoint_auth_method: AuthMethod::Public,
             redirect_uris: vec!["http://localhost:9000/implicit".into()],
             scope: "foo bar".into(),
             grant_types: vec!["implicit".into()],
+            client_name: None,
+            client_uri: None,
+            logo_uri: None,
         },
         Client {
             client_id: "oauth-client-service".into(),
             client_secret: Some("oauth-client-secret-service".into()),
+            token_endpoint_auth_method: AuthMethod::Basic,
             redirect_uris: vec![],
             scope: "read write".into(),
             grant_types: vec!["client_credentials".into()],
+            client_name: None,
+            client_uri: None,
+            logo_uri: None,
         },
         Client {
             client_id: "oauth-native-client".into(),
             client_secret: None,
+            token_endpoint_auth_method: AuthMethod::Public,
             redirect_uris: vec!["http://127.0.0.1/callback".into()],
             scope: "foo bar".into(),
             grant_types: vec!["authorization_code".into(), "refresh_token".into()],
+            client_name: None,
+            client_uri: None,
+            logo_uri: None,
         },
         Client {
             client_id: "oauth-client-trusted".into(),
             client_secret: Some("oauth-client-secret-trusted".into()),
+            token_endpoint_auth_method: AuthMethod::Basic,
             redirect_uris: vec![],
             scope: "foo bar read write".into(),
             grant_types: vec!["password".into(), "refresh_token".into()],
+            client_name: None,
+            client_uri: None,
+            logo_uri: None,
         },
     ]
+}
+
+/// Every client we know, by `client_id`.
+static CLIENTS: LazyLock<RwLock<HashMap<String, Arc<Client>>>> = LazyLock::new(|| {
+    let clients = built_in_clients().into_iter().map(|client| (client.client_id.clone(), Arc::new(client)));
+    RwLock::new(clients.collect())
 });
 
-fn get_client(client_id: &str) -> Option<&'static Client> {
-    CLIENTS.iter().find(|client| client.client_id == client_id)
+fn get_client(client_id: &str) -> Option<Arc<Client>> {
+    CLIENTS.read().unwrap_or_else(PoisonError::into_inner).get(client_id).cloned()
+}
+
+fn add_client(client: Client) {
+    CLIENTS.write().unwrap_or_else(PoisonError::into_inner).insert(client.client_id.clone(), Arc::new(client));
 }
 
 /// What the client asks /authorize for.
@@ -558,10 +612,13 @@ fn json_error(status: StatusCode, error: &str) -> Response {
 // ---------------------------------------------------------------------------
 
 async fn index() -> Response {
+    let mut clients: Vec<Client> =
+        CLIENTS.read().unwrap_or_else(PoisonError::into_inner).values().map(|client| Client::clone(client)).collect();
+    clients.sort_by(|a, b| a.client_id.cmp(&b.client_id));
     render(
         "index",
         context! {
-            clients => &*CLIENTS,
+            clients => clients,
             auth_server => context! {
                 authorization_endpoint => AUTHORIZATION_ENDPOINT,
                 token_endpoint => TOKEN_ENDPOINT,
@@ -630,7 +687,7 @@ async fn authorize(
 
     render(
         "approve",
-        context! { client => client, reqid => reqid, scope => rscope, users => &*USERS },
+        context! { client => &*client, reqid => reqid, scope => rscope, users => &*USERS },
     )
 }
 
@@ -666,7 +723,9 @@ async fn approve(
         println!("Approval for scopes that weren't requested: {scope:?}");
         return error_page("Invalid scope");
     }
-    let client = get_client(param(&query, "client_id")).expect("client was checked in /authorize");
+    let Some(client) = get_client(param(&query, "client_id")) else {
+        return error_page("Unknown client");
+    };
 
     match response_type {
         Some(ResponseType::Code) => {
@@ -687,7 +746,7 @@ async fn approve(
         Some(ResponseType::Token) => {
             // The implicit grant: the token goes straight back to the browser,
             // and never with a refresh token (RFC 6749 §4.2.2).
-            let grant = Grant::new(client, scope, Some(user.preferred_username.clone()));
+            let grant = Grant::new(&client, scope, Some(user.preferred_username.clone()));
             let access_token = grant.issue_access_token(&app.db);
             let scope = grant.scope.join(" ");
             redirect_back(
@@ -702,45 +761,34 @@ async fn approve(
 
 /// The token endpoint. The client calls this directly (not through the
 /// browser) to trade a grant, like an authorization code, for an access token.
-/// Works out which client is calling `/token` or `/revoke`: Basic auth or
-/// form parameters for confidential clients, `client_id` alone for public
-/// ones (RFC 6749 §2.3). `None` means it failed: answer 401 `invalid_client`.
-fn authenticate_client(headers: &HeaderMap, body: &HashMap<String, String>) -> Option<&'static Client> {
-    let mut client_id = None;
-    let mut client_secret = None;
-
-    // check the auth header
+/// Works out which client is calling `/token` or `/revoke`, by the method it
+/// registered: Basic or form parameters for confidential clients, `client_id`
+/// alone for public ones (RFC 6749 §2.3). `None` means it failed: answer 401
+/// `invalid_client`.
+fn authenticate_client(headers: &HeaderMap, body: &HashMap<String, String>) -> Option<Arc<Client>> {
     let basic = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(decode_client_credentials);
-    if let Some((id, secret)) = basic {
-        client_id = Some(id);
-        client_secret = Some(secret);
-    }
-
-    // otherwise, check the post body
-    if let Some(id) = body.get("client_id") {
-        if client_id.is_some() {
-            // if we've already seen the client's credentials in the authorization header, this is an error
+    let (client_id, secret, used) = match (basic, body.get("client_id")) {
+        (Some(_), Some(_)) => {
             println!("Client attempted to authenticate with multiple methods");
             return None;
         }
-        client_id = Some(id.clone());
-        client_secret = body.get("client_secret").cloned();
-    }
+        (Some((id, secret)), None) => (id, Some(secret), AuthMethod::Basic),
+        (None, Some(id)) => match body.get("client_secret") {
+            Some(secret) => (id.clone(), Some(secret.clone()), AuthMethod::Post),
+            None => (id.clone(), None, AuthMethod::Public),
+        },
+        (None, None) => {
+            println!("Client didn't say who it is");
+            return None;
+        }
+    };
 
-    let client_id = client_id.unwrap_or_default();
     let Some(client) = get_client(&client_id) else {
         println!("Unknown client {client_id}");
         return None;
     };
-
-    let authenticated = match (&client.client_secret, &client_secret) {
-        // a confidential client must prove it knows its secret
-        (Some(expected), Some(given)) => expected == given,
-        // a public client has no secret to prove: its client_id is all we get
-        (None, None) => true,
-        _ => false,
-    };
-    if !authenticated {
+    // the way it registered, and the secret it was given (none for a public client)
+    if used != client.token_endpoint_auth_method || secret != client.client_secret {
         println!("Client {client_id} failed to authenticate");
         return None;
     }
@@ -773,10 +821,10 @@ async fn token(
     }
 
     match grant_type {
-        "authorization_code" => authorization_code_grant(&app, client, &body).await,
-        "refresh_token" => refresh_token_grant(&app, client, &body),
-        "client_credentials" => client_credentials_grant(&app, client, &body),
-        "password" => password_grant(&app, client, &body).await,
+        "authorization_code" => authorization_code_grant(&app, &client, &body).await,
+        "refresh_token" => refresh_token_grant(&app, &client, &body),
+        "client_credentials" => client_credentials_grant(&app, &client, &body),
+        "password" => password_grant(&app, &client, &body).await,
         _ => unreachable!("checked against TOKEN_GRANT_TYPES"),
     }
 }
@@ -940,6 +988,118 @@ async fn revoke(
     StatusCode::OK.into_response()
 }
 
+// ---------------------------------------------------------------------------
+// Dynamic client registration (RFC 7591)
+// ---------------------------------------------------------------------------
+
+/// The grant types a client can register for. Not the password grant: that's
+/// for clients the server's owner trusts, and a stranger registering itself
+/// isn't one.
+const REGISTRABLE_GRANT_TYPES: &[&str] = &["authorization_code", "refresh_token", "client_credentials"];
+
+/// Every scope a client can register for.
+const KNOWN_SCOPES: &[&str] = &["foo", "bar", "read", "write", "delete", "fruit", "veggies", "meats", "movies", "foods", "music"];
+
+/// What a client may send to /register (RFC 7591 §2). Other fields are
+/// ignored. A field of the wrong type fails the whole parse.
+#[derive(Deserialize)]
+struct ClientMetadata {
+    redirect_uris: Option<Vec<String>>,
+    token_endpoint_auth_method: Option<AuthMethod>,
+    grant_types: Option<Vec<String>>,
+    response_types: Option<Vec<String>>,
+    scope: Option<String>,
+    client_name: Option<String>,
+    client_uri: Option<String>,
+    logo_uri: Option<String>,
+}
+
+/// 400 with a registration error (RFC 7591 §3.2.2).
+fn registration_error(error: &str, description: &str) -> Response {
+    println!("Registration refused: {description}");
+    (StatusCode::BAD_REQUEST, Json(json!({ "error": error, "error_description": description }))).into_response()
+}
+
+/// https anywhere, or http to this machine (RFC 8252 §7.3); never a fragment.
+fn is_acceptable_redirect_uri(uri: &str) -> bool {
+    let Ok(url) = Url::parse(uri) else {
+        return false;
+    };
+    let loopback = url.host() == Some(Host::Domain("localhost")) || is_loopback_ip(&url);
+    let scheme_ok = url.scheme() == "https" || (url.scheme() == "http" && loopback);
+    scheme_ok && url.host().is_some() && url.fragment().is_none()
+}
+
+/// A link we'd be willing to put in a page: no `javascript:` and friends.
+fn is_web_url(uri: &str) -> bool {
+    Url::parse(uri).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+}
+
+/// `POST /register`: a client introduces itself.
+async fn register(body: Bytes) -> Response {
+    let Ok(metadata) = serde_json::from_slice::<ClientMetadata>(&body) else {
+        return registration_error("invalid_client_metadata", "the body isn't client metadata in JSON");
+    };
+
+    let auth_method = metadata.token_endpoint_auth_method.unwrap_or(AuthMethod::Basic);
+    let grant_types = metadata.grant_types.unwrap_or_else(|| vec!["authorization_code".into()]);
+    if let Some(bad) = grant_types.iter().find(|g| !REGISTRABLE_GRANT_TYPES.contains(&g.as_str())) {
+        return registration_error("invalid_client_metadata", &format!("grant type {bad} isn't available"));
+    }
+    if auth_method == AuthMethod::Public && grant_types.iter().any(|g| g == "client_credentials") {
+        return registration_error("invalid_client_metadata", "a public client can't use client_credentials");
+    }
+
+    // "code" goes with authorization_code, and nothing else is supported
+    let uses_code = grant_types.iter().any(|g| g == "authorization_code");
+    let expected_response_types: &[&str] = if uses_code { &["code"] } else { &[] };
+    let response_types = metadata.response_types.unwrap_or_else(|| expected_response_types.iter().map(|t| t.to_string()).collect());
+    if !response_types.iter().map(String::as_str).eq(expected_response_types.iter().copied()) {
+        return registration_error("invalid_client_metadata", "response_types don't match grant_types");
+    }
+
+    let redirect_uris = metadata.redirect_uris.unwrap_or_default();
+    if uses_code && redirect_uris.is_empty() {
+        return registration_error("invalid_redirect_uri", "the authorization_code grant needs a redirect URI");
+    }
+    if let Some(bad) = redirect_uris.iter().find(|uri| !is_acceptable_redirect_uri(uri)) {
+        return registration_error("invalid_redirect_uri", &format!("{bad} isn't an acceptable redirect URI"));
+    }
+
+    let scope = metadata.scope.unwrap_or_default();
+    if let Some(bad) = split_scope(&scope).iter().find(|s| !KNOWN_SCOPES.contains(&s.as_str())) {
+        return registration_error("invalid_client_metadata", &format!("unknown scope {bad}"));
+    }
+    for uri in [&metadata.client_uri, &metadata.logo_uri].into_iter().flatten() {
+        if !is_web_url(uri) {
+            return registration_error("invalid_client_metadata", &format!("{uri} isn't an http(s) URL"));
+        }
+    }
+
+    let client = Client {
+        client_id: random_string(32),
+        client_secret: (auth_method != AuthMethod::Public).then(|| random_string(32)),
+        token_endpoint_auth_method: auth_method,
+        redirect_uris,
+        scope,
+        grant_types,
+        client_name: metadata.client_name,
+        client_uri: metadata.client_uri,
+        logo_uri: metadata.logo_uri,
+    };
+
+    let mut answer = serde_json::to_value(&client).expect("a client serializes");
+    answer["response_types"] = json!(response_types);
+    answer["client_id_issued_at"] = json!(now_secs());
+    if let Some(secret) = &client.client_secret {
+        answer["client_secret"] = json!(secret);
+        answer["client_secret_expires_at"] = json!(0);
+    }
+    println!("Registered client {}", client.client_id);
+    add_client(client);
+    (StatusCode::CREATED, Json(answer)).into_response()
+}
+
 fn requested_scope(client: &Client, body: &HashMap<String, String>) -> Option<Vec<String>> {
     let cscope = split_scope(&client.scope);
     match body.get("scope") {
@@ -1074,6 +1234,7 @@ async fn main() {
         .route("/token", post(token))
         .route("/introspect", post(introspect))
         .route("/revoke", post(revoke))
+        .route("/register", post(register))
         .layer(set_header(CACHE_CONTROL, "no-store"))
         .layer(set_header(PRAGMA, "no-cache"));
 
