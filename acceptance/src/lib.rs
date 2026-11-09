@@ -14,7 +14,10 @@
 
 use std::{
     collections::HashMap,
+    path::PathBuf,
+    process::Command,
     sync::{Mutex, MutexGuard},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use reqwest::{
@@ -373,4 +376,46 @@ pub fn client_shown_token(browser: &Client) -> Option<String> {
     let start = page.find(marker)? + marker.len();
     let token = page[start..].split('<').next()?.trim();
     (token != "NONE" && !token.is_empty()).then(|| token.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Programs you write (chapter 6 on)
+// ---------------------------------------------------------------------------
+
+/// Builds a binary from this workspace with `cargo build` and returns the
+/// path to the executable. Panics with the compiler's output if it doesn't
+/// build, or with a hint if the package doesn't exist yet.
+#[track_caller]
+pub fn build_bin(package: &str) -> PathBuf {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let output = Command::new(cargo)
+        .args(["build", "-q", "-p", package, "--bin", package, "--message-format=json"])
+        .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/.."))
+        .output()
+        .expect("run cargo build");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("did not match any packages") {
+        panic!("\n\nThere is no `{package}` crate yet. Create it and add it to the workspace members in Cargo.toml.\n\n");
+    }
+    if !output.status.success() {
+        let errors: Vec<String> = stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter_map(|msg| msg["message"]["rendered"].as_str().map(String::from))
+            .collect();
+        panic!("\n\n`{package}` doesn't build:\n{}{stderr}", errors.join(""));
+    }
+    stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|msg| msg["reason"] == "compiler-artifact" && msg["target"]["name"] == package)
+        .find_map(|msg| msg["executable"].as_str().map(PathBuf::from))
+        .unwrap_or_else(|| panic!("cargo built no `{package}` executable"))
+}
+
+/// A word nobody else will use, to find in shared data later.
+pub fn unique(prefix: &str) -> String {
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    format!("{prefix}{nanos}")
 }
