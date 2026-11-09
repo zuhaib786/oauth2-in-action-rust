@@ -21,7 +21,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use oauth_common::{context, param, parse_form, render};
 use serde_json::{Map, Value, json};
 use tokio::sync::Mutex;
@@ -39,6 +39,8 @@ const ISSUER: &str = "http://localhost:9001/";
 const AUDIENCE: &str = "http://localhost:9002/";
 /// How far apart our clock and the authorization server's may be.
 const CLOCK_SKEW: u64 = 30;
+/// Checks access token signatures (HS256). The authorization server signs with it.
+const SHARED_TOKEN_SECRET: &[u8] = b"shared OAuth token secret! (32 bytes or more)";
 
 /// The only origin whose pages may call these APIs from a browser.
 const CLIENT_ORIGIN: &str = "http://localhost:9000";
@@ -124,48 +126,29 @@ fn get_access_token(headers: &HeaderMap, form: &HashMap<String, String>) -> Resu
     claims.map(Value::Object).ok_or(Refusal::InvalidToken)
 }
 
-/// Decodes one part of a JWT: base64url, then a JSON object.
-fn decode_part(part: &str) -> Option<Map<String, Value>> {
-    let bytes = URL_SAFE_NO_PAD.decode(part).ok()?;
-    match serde_json::from_slice(&bytes).ok()? {
-        Value::Object(object) => Some(object),
-        _ => None,
-    }
-}
-
-/// Checks an unsigned JWT access token (RFC 9068 §4) and returns its claims.
+/// Checks a signed JWT access token (RFC 9068 §4) and returns its claims.
 fn check_jwt(token: &str) -> Option<Map<String, Value>> {
-    let parts: Vec<&str> = token.split('.').collect();
-    let [header, claims, signature] = parts[..] else {
-        return None;
-    };
-    let header = decode_part(header)?;
-    let claims = decode_part(claims)?;
-
-    // "none" is all we can check, so it's all we take: for now.
-    if header.get("alg")? != "none" || !signature.is_empty() {
-        return None;
-    }
-    let typ = header.get("typ")?.as_str()?.to_ascii_lowercase();
+    let typ = jsonwebtoken::decode_header(token).ok()?.typ?.to_ascii_lowercase();
     if typ != "at+jwt" && typ != "application/at+jwt" {
         return None;
     }
 
-    let now = now_secs();
-    let for_us = match claims.get("aud")? {
-        Value::String(aud) => aud == AUDIENCE,
-        Value::Array(auds) => auds.iter().any(|aud| aud == AUDIENCE),
-        _ => false,
-    };
-    let unexpired = claims.get("exp")?.as_u64()? + CLOCK_SKEW > now;
-    let started = claims.get("nbf").is_none_or(|nbf| nbf.as_u64().is_some_and(|nbf| nbf <= now + CLOCK_SKEW));
-    let valid = claims.get("iss")? == ISSUER && for_us && unexpired && started;
-    valid.then_some(claims)
-}
+    // HS256 and nothing else, whatever the header asks for (RFC 8725 §3.1)
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.set_issuer(&[ISSUER]);
+    validation.set_audience(&[AUDIENCE]);
+    validation.set_required_spec_claims(&["exp", "iss", "aud"]);
+    validation.validate_nbf = true;
+    validation.leeway = CLOCK_SKEW;
 
-/// Seconds since 1970, the unit of `exp` and `nbf`.
-fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+    let key = DecodingKey::from_secret(SHARED_TOKEN_SECRET);
+    match jsonwebtoken::decode::<Map<String, Value>>(token, &key, &validation) {
+        Ok(token) => Some(token.claims),
+        Err(e) => {
+            println!("Bad token: {e}");
+            None
+        }
+    }
 }
 
 /// Is this body a form we may look for a token in? (RFC 6750 §2.2)

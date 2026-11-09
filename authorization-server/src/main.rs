@@ -14,7 +14,6 @@ use std::{
 };
 
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use axum::{
     Form, Json, Router,
     extract::{Query, State},
@@ -25,12 +24,13 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
 };
+use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use oauth_common::{
     Db, build_url, build_url_with_fragment, context, decode_client_credentials, param, pkce_challenge, random_string,
     render,
 };
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::json;
 use tokio::sync::Mutex;
 use tower_http::set_header::SetResponseHeaderLayer;
 use url::{Host, Url};
@@ -46,6 +46,8 @@ const PROTECTED_RESOURCE: &str = "http://localhost:9002/";
 /// Seconds an access token stays good. Short, because a self-contained token
 /// can't be called back once it's out.
 const ACCESS_TOKEN_LIFETIME: u64 = 300;
+/// Signs access tokens (HS256). The protected resource holds the same secret.
+const SHARED_TOKEN_SECRET: &[u8] = b"shared OAuth token secret! (32 bytes or more)";
 
 // ---------------------------------------------------------------------------
 // Registered clients
@@ -316,7 +318,10 @@ impl<'a> Grant<'a> {
             "exp": iat + ACCESS_TOKEN_LIFETIME,
             "jti": jti,
         });
-        let access_token = unsigned_jwt(&json!({ "alg": "none", "typ": "at+jwt" }), &claims);
+        let mut header = Header::new(Algorithm::HS256);
+        header.typ = Some("at+jwt".into());
+        let access_token = jsonwebtoken::encode(&header, &claims, &EncodingKey::from_secret(SHARED_TOKEN_SECRET))
+            .expect("signing with HS256 doesn't fail");
         db.insert(json!({
             "jti": jti,
             "client_id": self.client.client_id,
@@ -346,11 +351,6 @@ impl<'a> Grant<'a> {
 /// Seconds since 1970: the unit of `iat` and `exp`.
 fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
-}
-
-/// `BASE64URL(header) "." BASE64URL(claims) "."`: a JWT with no signature.
-fn unsigned_jwt(header: &Value, claims: &Value) -> String {
-    format!("{}.{}.", URL_SAFE_NO_PAD.encode(header.to_string()), URL_SAFE_NO_PAD.encode(claims.to_string()))
 }
 
 /// Deletes every token issued under a grant.
