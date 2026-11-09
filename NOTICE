@@ -1,0 +1,10 @@
+OAuth 2 in Action, Rust edition
+https://github.com/zuhaib786/oauth2-in-action-rust
+
+This project is a Rust port of the exercises from "OAuth 2 in Action"
+by Justin Richer and Antonio Sanso:
+https://github.com/oauthinaction/oauth-in-action-code
+
+That code is licensed under the Apache License, Version 2.0. The HTML
+templates and the structure of the exercises in this project are adapted
+from it. The Rust code is a new implementation.
