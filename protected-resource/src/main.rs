@@ -65,7 +65,10 @@ fn get_access_token(
         query.get("access_token").cloned()
     };
 
-    println!("Incoming token: {}", in_token.as_deref().unwrap_or("(none)"));
+    println!(
+        "Incoming token: {}",
+        in_token.as_deref().unwrap_or("(none)")
+    );
     let in_token = in_token?;
 
     let found = db.find_one(|doc| doc["access_token"] == in_token.as_str());
@@ -133,7 +136,9 @@ async fn resource(_token: AccessToken) -> Response {
 
 /// Milliseconds since 1970, like JavaScript's `Date.now()`.
 fn now_millis() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 /// 403 Forbidden, telling the client which scope it was missing.
@@ -170,12 +175,6 @@ async fn delete_word(State(app): State<AppState>, token: AccessToken) -> Respons
 }
 
 async fn produce(token: AccessToken) -> Response {
-    let produce = json!({
-        "fruit": ["apple", "banana", "kiwi"],
-        "veggies": ["lettuce", "onion", "potato"],
-        "meats": ["bacon", "steak", "chicken breast"],
-    });
-
     /*
      * TODO: Add different kinds of produce based on the incoming token's scope
      *
@@ -186,7 +185,18 @@ async fn produce(token: AccessToken) -> Response {
      *         produce["fruit"] = json!(["apple", "banana", "kiwi"]);
      *     (the variable has to be `let mut` for that)
      */
+    let all_produce = json!({
+        "fruit": ["apple", "banana", "kiwi"],
+        "veggies": ["lettuce", "onion", "potato"],
+        "meats": ["bacon", "steak", "chicken breast"],
+    });
 
+    let mut produce = json!({"fruit": [],"veggies": [], "meats": []});
+    for scope in ["fruit", "veggies", "meats"] {
+        if token.has_scope(scope) {
+            produce[scope] = all_produce[scope].clone();
+        }
+    }
     Json(produce).into_response()
 }
 
@@ -194,7 +204,10 @@ async fn produce(token: AccessToken) -> Response {
 async fn main() {
     oauth_common::set_views_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/templates"));
 
-    let state = AppState { db: Db::shared(), saved_words: Arc::default() };
+    let state = AppState {
+        db: Db::shared(),
+        saved_words: Arc::default(),
+    };
 
     let app = Router::new()
         .route("/", get(|| async { render("index", context! {}) }))
