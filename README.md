@@ -138,7 +138,9 @@ authorization-server/   the OAuth authorization server (port 9001)
 protected-resource/     the protected API (port 9002)
   src/main.rs           the code
   templates/*.html      the web pages (from the book, using Jinja syntax)
-common/                 small helpers shared by all three (see below)
+word-bot/               a command-line client with no user (6-2)
+native-client/          a command-line client that logs in through the browser (6-5)
+common/                 small helpers shared by all of them (see below)
 acceptance/             black-box tests that run against the three servers
 exercises/              the specs for chapter 6 onwards
 database.jsonl          tokens issued by the authorization server and read by the
