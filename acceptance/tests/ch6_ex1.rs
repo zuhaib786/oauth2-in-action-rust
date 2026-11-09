@@ -101,6 +101,11 @@ fn r7_r8_deny_puts_the_error_and_state_in_the_fragment() {
 #[test]
 fn r6_r7_invalid_scope_goes_in_the_fragment() {
     let reply = authorize(&implicit_request("foo write"));
+    if !reply.is_redirect() {
+        // From 9-2 on, the server shows an error page here instead.
+        reply.assert_status(400);
+        return;
+    }
     let response = fragment_params(reply.location());
     assert_eq!(
         response.get("error").map(String::as_str),
@@ -117,6 +122,11 @@ fn r5_the_implicit_client_cannot_ask_for_a_code() {
         ("redirect_uri", IMPLICIT_REDIRECT),
         ("state", "st-5"),
     ]);
+    if !reply.is_redirect() {
+        // From 9-2 on, the server shows an error page here instead.
+        reply.assert_status(400);
+        return;
+    }
     let back = query_params(reply.location());
     assert_eq!(
         back.get("error").map(String::as_str),
@@ -133,6 +143,11 @@ fn r5_r7_the_code_client_cannot_ask_for_a_token() {
         ("redirect_uri", REDIRECT_URI),
         ("state", "st-6"),
     ]);
+    if !reply.is_redirect() {
+        // From 9-2 on, the server shows an error page here instead.
+        reply.assert_status(400);
+        return;
+    }
     assert_back_at(reply.location(), REDIRECT_URI);
     let response = fragment_params(reply.location());
     assert_eq!(
@@ -154,6 +169,11 @@ fn r4_unknown_or_missing_response_type() {
             params.push(("response_type", rt));
         }
         let reply = authorize(&params);
+        if !reply.is_redirect() {
+            // From 9-2 on, the server shows an error page here instead.
+            reply.assert_status(400);
+            continue;
+        }
         let back = query_params(reply.location());
         assert_eq!(
             back.get("error").map(String::as_str),
