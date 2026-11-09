@@ -212,9 +212,12 @@ async fn favorites(token: AccessToken) -> Response {
      *     Alice, the same with "Bob" for Bob
      */
 
-    let unknown =
-        json!({ "user": "Unknown", "favorites": { "movies": [], "foods": [], "music": [] } });
-    Json(unknown).into_response()
+    let response = match token.record["user"].as_str() {
+        Some("alice") => json!({"user": "Alice", "favorites" : alice_favorites}),
+        Some("bob") => json!({"user": "Bob", "favorites": bob_favorites}),
+        _ => json!({"user": "Unknown", "favorites": {"movies": [], "food": [], "music": []}}),
+    };
+    Json(response).into_response()
 }
 
 #[tokio::main]
