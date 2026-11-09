@@ -65,7 +65,10 @@ fn get_access_token(
         query.get("access_token").cloned()
     };
 
-    println!("Incoming token: {}", in_token.as_deref().unwrap_or("(none)"));
+    println!(
+        "Incoming token: {}",
+        in_token.as_deref().unwrap_or("(none)")
+    );
     let in_token = in_token?;
 
     let found = db.find_one(|doc| doc["access_token"] == in_token.as_str());
@@ -133,10 +136,12 @@ async fn resource(_token: AccessToken) -> Response {
 
 /// Milliseconds since 1970, like JavaScript's `Date.now()`.
 fn now_millis() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
-async fn get_words(State(app): State<AppState>, token: AccessToken) -> Response {
+async fn get_words(State(app): State<AppState>, token: AccessToken) -> Result<Response, Response> {
     /*
      * TODO: Make this function require the "read" scope.
      *
@@ -149,33 +154,52 @@ async fn get_words(State(app): State<AppState>, token: AccessToken) -> Response 
      *         )
      *             .into_response()
      */
+    require_scope(&token, "read")?;
     let saved_words = app.saved_words.lock().await;
-    Json(json!({ "words": saved_words.join(" "), "timestamp": now_millis() })).into_response()
+    Ok(Json(json!({ "words": saved_words.join(" "), "timestamp": now_millis() })).into_response())
 }
 
-async fn add_word(State(app): State<AppState>, token: AccessToken) -> Response {
+async fn add_word(State(app): State<AppState>, token: AccessToken) -> Result<Response, Response> {
     /*
      * TODO: Make this function require the "write" scope
      */
+    require_scope(&token, "write")?;
     if let Some(word) = token.form.get("word") {
         app.saved_words.lock().await.push(word.clone());
     }
-    StatusCode::CREATED.into_response()
+    Ok(StatusCode::CREATED.into_response())
 }
 
-async fn delete_word(State(app): State<AppState>, token: AccessToken) -> Response {
+fn require_scope(access_token: &AccessToken, scope: &str) -> Result<(), Response> {
+    if access_token.has_scope(scope) {
+        return Ok(());
+    }
+    println!("Missing required scope: {scope}");
+    let challenge =
+        format!(r#"Bearer realm="localhost:9002", error="insufficient_scope", scope="{scope}""#);
+    Err((StatusCode::FORBIDDEN, [("WWW-Authenticate", challenge)]).into_response())
+}
+
+async fn delete_word(
+    State(app): State<AppState>,
+    token: AccessToken,
+) -> Result<Response, Response> {
     /*
      * TODO: Make this function require the "delete" scope
      */
+    require_scope(&token, "delete")?;
     app.saved_words.lock().await.pop();
-    StatusCode::NO_CONTENT.into_response()
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 #[tokio::main]
 async fn main() {
     oauth_common::set_views_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/templates"));
 
-    let state = AppState { db: Db::shared(), saved_words: Arc::default() };
+    let state = AppState {
+        db: Db::shared(),
+        saved_words: Arc::default(),
+    };
 
     let app = Router::new()
         .route("/", get(|| async { render("index", context! {}) }))
