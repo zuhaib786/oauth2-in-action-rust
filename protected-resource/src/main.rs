@@ -13,12 +13,12 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{FromRequest, Request, State},
+    extract::{FromRequest, Query, Request, State},
     http::{HeaderMap, StatusCode, header::WWW_AUTHENTICATE},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
-use oauth_common::{Db, context, parse_form, render};
+use oauth_common::{Db, context, param, parse_form, render};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
@@ -196,6 +196,26 @@ async fn favorites(token: AccessToken) -> Response {
     Json(response).into_response()
 }
 
+// ---------------------------------------------------------------------------
+// Hello World API (chapter 8)
+// ---------------------------------------------------------------------------
+
+/// Greets you in the language you ask for: `/helloWorld?language=en`.
+///
+/// Written the way the book first writes it. Exercise 8-1 is about what's
+/// wrong with it.
+async fn hello_world(Query(query): Query<HashMap<String, String>>, _token: AccessToken) -> Response {
+    let greeting = match param(&query, "language") {
+        "en" => "Hello World".to_string(),
+        "de" => "Hallo Welt".to_string(),
+        "it" => "Ciao Mondo".to_string(),
+        "fr" => "Bonjour monde".to_string(),
+        "es" => "Hola mundo".to_string(),
+        other => format!("Error, invalid language: {other}"),
+    };
+    Html(greeting).into_response()
+}
+
 #[tokio::main]
 async fn main() {
     oauth_common::set_views_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/templates"));
@@ -208,6 +228,7 @@ async fn main() {
         .route("/words", get(get_words).post(add_word).delete(delete_word))
         .route("/produce", get(produce))
         .route("/favorites", get(favorites))
+        .route("/helloWorld", get(hello_world))
         .layer(CorsLayer::permissive()) // `app.use(cors())`
         .with_state(state);
 
