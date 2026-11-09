@@ -28,7 +28,9 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
 };
-use oauth_common::{Db, build_url, context, decode_client_credentials, param, random_string, render};
+use oauth_common::{
+    Db, build_url, context, decode_client_credentials, param, random_string, render,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -98,7 +100,9 @@ static USERS: LazyLock<Vec<User>> = LazyLock::new(|| {
 });
 
 fn get_user(username: &str) -> Option<&'static User> {
-    USERS.iter().find(|user| user.preferred_username == username)
+    USERS
+        .iter()
+        .find(|user| user.preferred_username == username)
 }
 
 // ---------------------------------------------------------------------------
@@ -203,14 +207,24 @@ async fn authorize(
     };
 
     if !client.redirect_uris.iter().any(|uri| uri == redirect_uri) {
-        println!("Mismatched redirect URI, expected {:?} got {redirect_uri}", client.redirect_uris);
+        println!(
+            "Mismatched redirect URI, expected {:?} got {redirect_uri}",
+            client.redirect_uris
+        );
         return render("error", context! { error => "Invalid redirect URI" });
     }
 
     let reqid = random_string(8);
-    app.inner.lock().await.requests.insert(reqid.clone(), query.clone());
+    app.inner
+        .lock()
+        .await
+        .requests
+        .insert(reqid.clone(), query.clone());
 
-    render("approve", context! { client => client, reqid => reqid, users => &*USERS })
+    render(
+        "approve",
+        context! { client => client, reqid => reqid, users => &*USERS },
+    )
 }
 
 /// The approval page's form posts here when the user clicks Approve or Deny.
@@ -222,7 +236,10 @@ async fn approve(
 
     let Some(query) = state.requests.remove(param(&form, "reqid")) else {
         // there was no matching saved request, this is an error
-        return render("error", context! { error => "No matching authorization request" });
+        return render(
+            "error",
+            context! { error => "No matching authorization request" },
+        );
     };
     let redirect_uri = param(&query, "redirect_uri");
 
@@ -240,7 +257,10 @@ async fn approve(
     let username = param(&form, "user");
     let Some(user) = get_user(username) else {
         println!("Unknown user {username}");
-        return render("error", context! { error => format!("Unknown user {username}") });
+        return render(
+            "error",
+            context! { error => format!("Unknown user {username}") },
+        );
     };
 
     let code = random_string(8);
@@ -255,7 +275,11 @@ async fn approve(
     // save the code and request for later
     state.codes.insert(
         code.clone(),
-        CodeInfo { request: query, scope: Vec::new(), user: user.preferred_username.clone() },
+        CodeInfo {
+            request: query,
+            scope: Vec::new(),
+            user: user.preferred_username.clone(),
+        },
     );
 
     Redirect::to(&location).into_response()
@@ -298,7 +322,10 @@ async fn token(
     };
 
     if client_secret.as_deref() != Some(client.client_secret.as_str()) {
-        println!("Mismatched client secret, expected {} got {client_secret:?}", client.client_secret);
+        println!(
+            "Mismatched client secret, expected {} got {client_secret:?}",
+            client.client_secret
+        );
         return json_error(StatusCode::UNAUTHORIZED, "invalid_client");
     }
 
@@ -316,11 +343,42 @@ async fn token(
          *   - issues and saves a new access token for the same client and user
          *   - answers with the new access token and the same refresh token
          */
+        "refresh_token" => refresh_token_grant(&app, client, &body),
         other => {
             println!("Unknown grant type {other}");
             json_error(StatusCode::BAD_REQUEST, "unsupported_grant_type")
         }
     }
+}
+
+fn refresh_token_grant(
+    app: &AppState,
+    client: &Client,
+    body: &HashMap<String, String>,
+) -> Response {
+    let Some(refresh_token) = body.get("refresh_token") else {
+        println!("Refresh token not set");
+        return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
+    };
+    let Some(doc) = app
+        .db
+        .find_one(|doc| &doc["refresh_token"] == refresh_token)
+    else {
+        println!("Invalid refresh token: {}", refresh_token);
+        return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
+    };
+
+    // found the refresh token
+    if doc["client_id"] != client.client_id {
+        app.db.remove(|doc| &doc["refresh_token"] == refresh_token);
+        return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
+    }
+    // refresh token belongs to the intended client
+    let access_token = random_string(32);
+    app.db.insert(json!({"client_id": client.client_id, "scope": doc["scope"], "access_token": access_token, "user": doc["user"]}));
+    Json(
+        json!({"access_token": access_token, "refresh_token": refresh_token, "token_type": "Bearer"})
+        ).into_response()
 }
 
 /// grant_type=authorization_code: trade a code from /approve for a token.
@@ -339,7 +397,10 @@ async fn authorization_code_grant(
 
     let code_client_id = param(&code.request, "client_id");
     if code_client_id != client.client_id {
-        println!("Client mismatch, expected {code_client_id} got {}", client.client_id);
+        println!(
+            "Client mismatch, expected {code_client_id} got {}",
+            client.client_id
+        );
         return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
     }
 
@@ -357,11 +418,17 @@ async fn authorization_code_grant(
      * it in the response.
      */
 
+    let refresh_token = random_string(32);
+    app.db.insert(
+        json!({"refresh_token": &refresh_token, "client_id": client.client_id, "scope": code.scope, "user": code.user})
+        );
+
     println!("Issuing access token {access_token}");
     println!("Issued tokens for code {code_value}");
 
     Json(json!({
         "access_token": access_token,
+        "refresh_token": refresh_token,
         "token_type": "Bearer",
     }))
     .into_response()
@@ -375,7 +442,10 @@ async fn main() {
     // clear the database on startup
     db.clear();
 
-    let state = AppState { inner: Arc::default(), db };
+    let state = AppState {
+        inner: Arc::default(),
+        db,
+    };
 
     let app = Router::new()
         .route("/", get(index))
