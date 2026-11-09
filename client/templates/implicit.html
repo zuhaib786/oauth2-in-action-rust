@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block content %}
+      <div class="jumbotron">
+        <h2>Browser-only client <small>implicit grant</small></h2>
+        <p>
+          Everything on this page happens in your browser. The script at the
+          bottom asks the authorization server for a token, reads it out of
+          the URL fragment and calls the protected resource itself. The client's
+          Rust code only serves this page.
+        </p>
+        <p>Access token value: <span class="label label-danger" id="access-token">NONE</span></p>
+        <p>Scope value: <span class="label label-danger" id="scope">NONE</span></p>
+        <button class="btn btn-default" id="authorize">Get OAuth Token</button>
+        <button class="btn btn-default" id="fetch">Get Protected Resource</button>
+        <a class="btn btn-link" href="/">Back to the web client</a>
+      </div>
+      <div class="alert alert-danger" id="error" hidden></div>
+      <pre id="resource" hidden></pre>
+
+      <script>
+        "use strict";
+
+        const authServer = { authorizationEndpoint: "http://localhost:9001/authorize" };
+        const client = {
+          clientId: "oauth-client-implicit",
+          redirectUri: "http://localhost:9000/implicit",
+          scope: "foo bar",
+        };
+        const protectedResource = "http://localhost:9002/resource";
+
+        // Kept in memory only: reloading the page forgets it.
+        let accessToken = null;
+
+        function show(id, text) {
+          const element = document.getElementById(id);
+          element.textContent = text; // textContent, never innerHTML, for anything from a URL
+          element.hidden = false;
+        }
+
+        function randomState() {
+          const bytes = new Uint8Array(16);
+          crypto.getRandomValues(bytes);
+          return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+        }
+
+        document.getElementById("authorize").addEventListener("click", () => {
+          const state = randomState();
+          // Survives the round trip to the authorization server, in this tab only.
+          sessionStorage.setItem("oauth-state", state);
+          const params = new URLSearchParams({
+            response_type: "token",
+            client_id: client.clientId,
+            redirect_uri: client.redirectUri,
+            scope: client.scope,
+            state: state,
+          });
+          location.assign(authServer.authorizationEndpoint + "?" + params);
+        });
+
+        document.getElementById("fetch").addEventListener("click", async () => {
+          if (!accessToken) {
+            show("error", "Missing access token");
+            return;
+          }
+          const res = await fetch(protectedResource, {
+            method: "POST",
+            headers: { Authorization: "Bearer " + accessToken },
+          });
+          if (res.ok) {
+            show("resource", JSON.stringify(await res.json(), null, 4));
+          } else {
+            show("error", "The protected resource answered " + res.status);
+          }
+        });
+
+        // Back from the authorization server? Its answer is in the fragment.
+        if (location.hash.length > 1) {
+          const response = new URLSearchParams(location.hash.substring(1));
+          // Take the token out of the address bar and the history at once.
+          history.replaceState(null, "", location.pathname);
+
+          const expectedState = sessionStorage.getItem("oauth-state");
+          sessionStorage.removeItem("oauth-state");
+
+          if (!expectedState || response.get("state") !== expectedState) {
+            show("error", "State value did not match");
+          } else if (response.has("error")) {
+            show("error", "Authorization failed: " + response.get("error"));
+          } else {
+            accessToken = response.get("access_token");
+            document.getElementById("access-token").textContent = accessToken;
+            document.getElementById("scope").textContent = response.get("scope") || "NONE";
+          }
+        }
+      </script>
+{% endblock %}

@@ -114,6 +114,10 @@ is running. The helpers they use are in `acceptance/src/lib.rs`, and you're
 welcome to add tests of your own. Some requirements can't be checked from the
 outside (how you store passwords, say). The spec marks those "not tested".
 
+| Book exercise | Tag prefix | What you build | Spec | Browse |
+|---|---|---|---|---|
+| 6-1 | `ch6-ex1` | Authorization server: the implicit grant, public clients, grant types per client | [spec](exercises/ch6-ex1.md) | [start](https://github.com/zuhaib786/oauth2-in-action-rust/tree/ch6-ex1-start) · [solution](https://github.com/zuhaib786/oauth2-in-action-rust/compare/ch6-ex1-start...ch6-ex1-done) |
+
 ### One reader's solutions
 
 The `solutions/zuhaib/*` branches hold the author's own attempts, written while
