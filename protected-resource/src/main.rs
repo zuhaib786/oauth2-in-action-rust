@@ -8,7 +8,7 @@
 use std::{
     collections::HashMap,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -21,7 +21,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use jsonwebtoken::{Algorithm, DecodingKey, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, jwk::JwkSet};
 use oauth_common::{context, param, parse_form, render};
 use serde_json::{Map, Value, json};
 use tokio::sync::Mutex;
@@ -39,8 +39,11 @@ const ISSUER: &str = "http://localhost:9001/";
 const AUDIENCE: &str = "http://localhost:9002/";
 /// How far apart our clock and the authorization server's may be.
 const CLOCK_SKEW: u64 = 30;
-/// Checks access token signatures (HS256). The authorization server signs with it.
-const SHARED_TOKEN_SECRET: &[u8] = b"shared OAuth token secret! (32 bytes or more)";
+/// Where the authorization server publishes the keys it signs tokens with.
+const JWKS_URI: &str = "http://localhost:9001/jwks";
+/// Don't fetch the JWK Set more often than this, however many unknown `kid`s
+/// show up.
+const JWKS_REFETCH_INTERVAL: Duration = Duration::from_secs(10);
 
 /// The only origin whose pages may call these APIs from a browser.
 const CLIENT_ORIGIN: &str = "http://localhost:9000";
@@ -61,6 +64,38 @@ fn cors() -> CorsLayer {
 struct AppState {
     /// The Words API's data (`var savedWords = []` in the JS).
     saved_words: Arc<Mutex<Vec<String>>>,
+    /// The authorization server's public keys.
+    keys: Arc<Mutex<Keys>>,
+    http: reqwest::Client,
+}
+
+/// The authorization server's JWK Set, as last fetched.
+#[derive(Default)]
+struct Keys {
+    set: Option<JwkSet>,
+    fetched_at: Option<Instant>,
+}
+
+impl AppState {
+    /// The authorization server's key with this `kid`. Fetches the JWK Set
+    /// when the key isn't known yet: the server may have rotated keys.
+    async fn signing_key(&self, kid: &str) -> Option<DecodingKey> {
+        let mut keys = self.keys.lock().await;
+        let known = |keys: &Keys| keys.set.as_ref().and_then(|set| set.find(kid)).cloned();
+        if known(&keys).is_none() && keys.fetched_at.is_none_or(|at| at.elapsed() >= JWKS_REFETCH_INTERVAL) {
+            keys.fetched_at = Some(Instant::now());
+            match self.fetch_jwks().await {
+                Ok(set) => keys.set = Some(set),
+                Err(e) => println!("Couldn't fetch {JWKS_URI}: {e}"),
+            }
+        }
+        DecodingKey::from_jwk(&known(&keys)?).ok()
+    }
+
+    async fn fetch_jwks(&self) -> reqwest::Result<JwkSet> {
+        println!("Fetching {JWKS_URI}");
+        self.http.get(JWKS_URI).send().await?.error_for_status()?.json().await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -102,7 +137,7 @@ impl IntoResponse for Refusal {
 
 /// Finds the access token in the `Authorization: Bearer` header or the form
 /// body (never the URL: RFC 6750 §2.3), then checks it. Returns its claims.
-fn get_access_token(headers: &HeaderMap, form: &HashMap<String, String>) -> Result<Value, Refusal> {
+async fn get_access_token(app: &AppState, headers: &HeaderMap, form: &HashMap<String, String>) -> Result<Value, Refusal> {
     let from_header = headers
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -118,7 +153,7 @@ fn get_access_token(headers: &HeaderMap, form: &HashMap<String, String>) -> Resu
         (None, None) => return Err(Refusal::NoToken),
     };
 
-    let claims = check_jwt(&in_token);
+    let claims = check_jwt(app, &in_token).await;
     match &claims {
         Some(claims) => println!("Accepted a token for {}", claims["sub"]),
         None => println!("Refused token {in_token}"),
@@ -127,21 +162,25 @@ fn get_access_token(headers: &HeaderMap, form: &HashMap<String, String>) -> Resu
 }
 
 /// Checks a signed JWT access token (RFC 9068 §4) and returns its claims.
-fn check_jwt(token: &str) -> Option<Map<String, Value>> {
-    let typ = jsonwebtoken::decode_header(token).ok()?.typ?.to_ascii_lowercase();
+async fn check_jwt(app: &AppState, token: &str) -> Option<Map<String, Value>> {
+    let header = jsonwebtoken::decode_header(token).ok()?;
+    let typ = header.typ?.to_ascii_lowercase();
     if typ != "at+jwt" && typ != "application/at+jwt" {
         return None;
     }
+    // RS256 and nothing else, whatever the header asks for (RFC 8725 §3.1)
+    if header.alg != Algorithm::RS256 {
+        return None;
+    }
+    let key = app.signing_key(&header.kid?).await?;
 
-    // HS256 and nothing else, whatever the header asks for (RFC 8725 §3.1)
-    let mut validation = Validation::new(Algorithm::HS256);
+    let mut validation = Validation::new(Algorithm::RS256);
     validation.set_issuer(&[ISSUER]);
     validation.set_audience(&[AUDIENCE]);
     validation.set_required_spec_claims(&["exp", "iss", "aud"]);
     validation.validate_nbf = true;
     validation.leeway = CLOCK_SKEW;
 
-    let key = DecodingKey::from_secret(SHARED_TOKEN_SECRET);
     match jsonwebtoken::decode::<Map<String, Value>>(token, &key, &validation) {
         Ok(token) => Some(token.claims),
         Err(e) => {
@@ -189,7 +228,7 @@ impl AccessToken {
 impl FromRequest<AppState> for AccessToken {
     type Rejection = Refusal;
 
-    async fn from_request(req: Request, _state: &AppState) -> Result<Self, Self::Rejection> {
+    async fn from_request(req: Request, state: &AppState) -> Result<Self, Self::Rejection> {
         let (parts, body) = req.into_parts();
         let form = if has_form_body(&parts.method, &parts.headers) {
             let body = axum::body::to_bytes(body, 64 * 1024).await.map_err(|_| Refusal::InvalidRequest)?;
@@ -198,7 +237,7 @@ impl FromRequest<AppState> for AccessToken {
             HashMap::new()
         };
 
-        let claims = get_access_token(&parts.headers, &form)?;
+        let claims = get_access_token(state, &parts.headers, &form).await?;
         Ok(AccessToken { claims, form })
     }
 }
@@ -309,7 +348,7 @@ async fn hello_world(Query(query): Query<HashMap<String, String>>, _token: Acces
 async fn main() {
     oauth_common::set_views_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/templates"));
 
-    let state = AppState { saved_words: Arc::default() };
+    let state = AppState { saved_words: Arc::default(), keys: Arc::default(), http: reqwest::Client::new() };
 
     let app = Router::new()
         .route("/", get(|| async { render("index", context! {}) }))

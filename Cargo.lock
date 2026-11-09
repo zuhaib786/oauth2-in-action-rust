@@ -813,6 +813,7 @@ dependencies = [
  "axum",
  "jsonwebtoken",
  "oauth-common",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

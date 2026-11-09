@@ -19,7 +19,10 @@ use axum::{
     extract::{Query, State},
     http::{
         HeaderMap, HeaderName, HeaderValue, StatusCode,
-        header::{CACHE_CONTROL, CONTENT_SECURITY_POLICY, PRAGMA, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS},
+        header::{
+            CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, PRAGMA, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS,
+            X_FRAME_OPTIONS,
+        },
     },
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -30,7 +33,7 @@ use oauth_common::{
     render,
 };
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tower_http::set_header::SetResponseHeaderLayer;
 use url::{Host, Url};
@@ -46,8 +49,22 @@ const PROTECTED_RESOURCE: &str = "http://localhost:9002/";
 /// Seconds an access token stays good. Short, because a self-contained token
 /// can't be called back once it's out.
 const ACCESS_TOKEN_LIFETIME: u64 = 300;
-/// Signs access tokens (HS256). The protected resource holds the same secret.
-const SHARED_TOKEN_SECRET: &[u8] = b"shared OAuth token secret! (32 bytes or more)";
+
+/// The public half of our signing key, as a JWK Set, served at /jwks. Made
+/// once from the private key: `n` from `openssl rsa -in keys/signing-key.pem
+/// -noout -modulus`, and the `kid` is the key's RFC 7638 thumbprint.
+const JWKS: &str = include_str!("../keys/jwks.json");
+
+/// Signs access tokens (RS256). Only we have it.
+static SIGNING_KEY: LazyLock<EncodingKey> = LazyLock::new(|| {
+    EncodingKey::from_rsa_pem(include_bytes!("../keys/signing-key.pem")).expect("keys/signing-key.pem is an RSA key")
+});
+
+/// The `kid` of the signing key, as published in the JWK Set.
+static SIGNING_KEY_ID: LazyLock<String> = LazyLock::new(|| {
+    let jwks: Value = serde_json::from_str(JWKS).expect("keys/jwks.json is JSON");
+    jwks["keys"][0]["kid"].as_str().expect("keys/jwks.json has a kid").to_string()
+});
 
 // ---------------------------------------------------------------------------
 // Registered clients
@@ -318,10 +335,10 @@ impl<'a> Grant<'a> {
             "exp": iat + ACCESS_TOKEN_LIFETIME,
             "jti": jti,
         });
-        let mut header = Header::new(Algorithm::HS256);
+        let mut header = Header::new(Algorithm::RS256);
         header.typ = Some("at+jwt".into());
-        let access_token = jsonwebtoken::encode(&header, &claims, &EncodingKey::from_secret(SHARED_TOKEN_SECRET))
-            .expect("signing with HS256 doesn't fail");
+        header.kid = Some(SIGNING_KEY_ID.clone());
+        let access_token = jsonwebtoken::encode(&header, &claims, &SIGNING_KEY).expect("signing with RS256 doesn't fail");
         db.insert(json!({
             "jti": jti,
             "client_id": self.client.client_id,
@@ -906,6 +923,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/", get(index))
+        .route("/jwks", get(|| async { ([(CONTENT_TYPE, "application/jwk-set+json")], JWKS) }))
         .route("/authorize", get(authorize))
         .route("/approve", post(approve))
         .merge(token_endpoint)
