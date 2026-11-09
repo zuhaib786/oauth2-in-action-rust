@@ -262,6 +262,16 @@ pub fn get_code_with(extra: &[(&str, &str)], scope: &str, user: &str) -> String 
 // Authorization server: the back channel (token endpoint)
 // ---------------------------------------------------------------------------
 
+/// A fresh PKCE code verifier and its S256 challenge (RFC 7636 §4.1, §4.2).
+pub fn pkce_pair() -> (String, String) {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use sha2::{Digest, Sha256};
+
+    let verifier = format!("{:-<64}", unique("verifier"));
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    (verifier, challenge)
+}
+
 /// `POST /token` authenticated as oauth-client-1 with HTTP Basic.
 pub fn token_request(form: &[(&str, &str)]) -> Reply {
     token_request_as(CLIENT_ID, CLIENT_SECRET, form)

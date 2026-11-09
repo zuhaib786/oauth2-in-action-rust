@@ -126,6 +126,7 @@ outside (how you store passwords, say). The spec marks those "not tested".
 | 8-3 | `ch8-ex3` | Both servers: HSTS, `no-store` on token responses, anti-clickjacking, referrer policy | [spec](exercises/ch8-ex3.md) | [start](https://github.com/zuhaib786/oauth2-in-action-rust/tree/ch8-ex3-start) · [solution](https://github.com/zuhaib786/oauth2-in-action-rust/compare/ch8-ex3-start...ch8-ex3-done) |
 | 9-1 | `ch9-ex1` | Authorization server: `redirect_uri` checked at the token endpoint, code replay revokes tokens, unguessable codes | [spec](exercises/ch9-ex1.md) | [start](https://github.com/zuhaib786/oauth2-in-action-rust/tree/ch9-ex1-start) · [solution](https://github.com/zuhaib786/oauth2-in-action-rust/compare/ch9-ex1-start...ch9-ex1-done) |
 | 9-2 | `ch9-ex2` | Authorization server: no redirects for scope errors, no granting unrequested scopes, no repeated parameters | [spec](exercises/ch9-ex2.md) | [start](https://github.com/zuhaib786/oauth2-in-action-rust/tree/ch9-ex2-start) · [solution](https://github.com/zuhaib786/oauth2-in-action-rust/compare/ch9-ex2-start...ch9-ex2-done) |
+| 10-1 | `ch10-ex1` | PKCE everywhere: the authorization server (with downgrade protection), the web client and `native-client` | [spec](exercises/ch10-ex1.md) | [start](https://github.com/zuhaib786/oauth2-in-action-rust/tree/ch10-ex1-start) · [solution](https://github.com/zuhaib786/oauth2-in-action-rust/compare/ch10-ex1-start...ch10-ex1-done) |
 
 ### One reader's solutions
 

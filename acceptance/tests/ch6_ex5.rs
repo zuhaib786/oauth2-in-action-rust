@@ -4,13 +4,20 @@ use acceptance::*;
 
 const NATIVE_ID: &str = "oauth-native-client";
 
-fn native_request(redirect_uri: &str) -> [(&'static str, &str); 5] {
+// PKCE (chapter 10) is required for public clients from 10-1 on. Before
+// that, the server just ignores these. The pair is RFC 7636's own example.
+const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
+fn native_request(redirect_uri: &str) -> [(&'static str, &str); 7] {
     [
         ("response_type", "code"),
         ("client_id", NATIVE_ID),
         ("redirect_uri", redirect_uri),
         ("scope", "foo bar"),
         ("state", "st-native"),
+        ("code_challenge", CHALLENGE),
+        ("code_challenge_method", "S256"),
     ]
 }
 
@@ -68,6 +75,7 @@ fn r4_the_native_client_trades_its_code_without_a_secret() {
         ("grant_type", "authorization_code"),
         ("code", &code),
         ("redirect_uri", redirect_uri),
+        ("code_verifier", VERIFIER),
     ]);
     reply.assert_status(200);
     get_resource(reply.json()["access_token"].as_str().unwrap()).assert_status(200);
