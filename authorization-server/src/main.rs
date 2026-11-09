@@ -229,6 +229,12 @@ async fn authorize(
      *   - if so: redirect_with_error(redirect_uri, "invalid_scope")
      */
 
+    let requested_scopes = split_scope(param(&query, "scope"));
+    if has_extra_scope(&requested_scopes, &split_scope(&client.scope)) {
+        println!("Requested extra scopes: {:?}", requested_scopes);
+        return redirect_with_error(redirect_uri, "invalid_scope");
+    }
+
     let reqid = random_string(8);
     app.inner
         .lock()
@@ -243,7 +249,7 @@ async fn authorize(
      */
     render(
         "approve",
-        context! { client => client, reqid => reqid, users => &*USERS },
+        context! { client => client, reqid => reqid, users => &*USERS , scope => &requested_scopes},
     )
 }
 
@@ -283,11 +289,19 @@ async fn approve(
         );
     };
 
+    let client_id = param(&query, "client_id"); // should not be empty
+    let Some(client) = get_client(client_id) else {
+        return redirect_with_error(redirect_uri, "invalid_client"); // SHould never fire;
+    };
     /*
      * TODO: Make sure the approved scopes from the form are allowed for this
      * client. scopes_from_form(&form) gives you the ticked ones. If any isn't
      * allowed: redirect_with_error(redirect_uri, "invalid_scope")
      */
+    let requested_scopes = scopes_from_form(&form);
+    if has_extra_scope(&requested_scopes, &split_scope(&client.scope)) {
+        return redirect_with_error(redirect_uri, "invalid_scope");
+    }
 
     let code = random_string(8);
 
@@ -304,7 +318,7 @@ async fn approve(
         // TODO: save the approved scopes here instead of an empty list
         CodeInfo {
             request: query,
-            scope: Vec::new(),
+            scope: requested_scopes,
             user: user.preferred_username.clone(),
         },
     );
@@ -413,6 +427,7 @@ async fn authorization_code_grant(
         "access_token": access_token,
         "token_type": "Bearer",
         "refresh_token": refresh_token,
+        "scope": code.scope.join(" "),
         // TODO: Return scopes as part of the token response: "scope": "foo bar"
     }))
     .into_response()
@@ -456,6 +471,14 @@ fn refresh_token_grant(
         "access_token": access_token,
         "token_type": "Bearer",
         "refresh_token": refresh_token,
+        "scope": token["scope"]
+            .as_array()
+            .map(|list| {
+                list.iter()
+                    .filter_map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }).unwrap_or_default(),
         // TODO: Return scopes here too. The stored token["scope"] is a JSON
         // list like ["foo", "bar"]; the response needs the string "foo bar".
     }))
