@@ -17,7 +17,10 @@ use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::{
     Form, Json, Router,
     extract::{Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{
+        HeaderMap, HeaderName, HeaderValue, StatusCode,
+        header::{CACHE_CONTROL, CONTENT_SECURITY_POLICY, PRAGMA, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS},
+    },
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
 };
@@ -27,6 +30,7 @@ use oauth_common::{
 use serde::Serialize;
 use serde_json::json;
 use tokio::sync::Mutex;
+use tower_http::set_header::SetResponseHeaderLayer;
 use url::{Host, Url};
 
 // authorization server information
@@ -703,6 +707,11 @@ async fn password_grant(app: &AppState, client: &Client, body: &HashMap<String, 
     token_response(&access_token, refresh_token.as_deref(), &scope)
 }
 
+/// A layer that puts `name: value` on every response.
+fn set_header(name: HeaderName, value: &'static str) -> SetResponseHeaderLayer<HeaderValue> {
+    SetResponseHeaderLayer::overriding(name, HeaderValue::from_static(value))
+}
+
 #[tokio::main]
 async fn main() {
     oauth_common::set_views_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/templates"));
@@ -713,11 +722,23 @@ async fn main() {
 
     let state = AppState { inner: Arc::default(), db };
 
+    // A token response is a credential: no cache may keep it (RFC 6749 §5.1).
+    let token_endpoint = Router::new()
+        .route("/token", post(token))
+        .layer(set_header(CACHE_CONTROL, "no-store"))
+        .layer(set_header(PRAGMA, "no-cache"));
+
     let app = Router::new()
         .route("/", get(index))
         .route("/authorize", get(authorize))
         .route("/approve", post(approve))
-        .route("/token", post(token))
+        .merge(token_endpoint)
+        // No other site may frame our pages and trick the user into clicking (RFC 6749 §10.13).
+        .layer(set_header(X_FRAME_OPTIONS, "DENY"))
+        .layer(set_header(CONTENT_SECURITY_POLICY, "frame-ancestors 'none'"))
+        .layer(set_header(X_CONTENT_TYPE_OPTIONS, "nosniff"))
+        // The authorization request in our URLs stays out of Referer headers.
+        .layer(set_header(REFERRER_POLICY, "no-referrer"))
         .with_state(state);
 
     oauth_common::serve(app, 9001, "OAuth Authorization Server").await;
