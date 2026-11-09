@@ -20,20 +20,20 @@ use axum::{
     http::{
         HeaderMap, HeaderName, HeaderValue, StatusCode,
         header::{
-            CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, PRAGMA, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS,
+            CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, WWW_AUTHENTICATE, PRAGMA, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS,
             X_FRAME_OPTIONS,
         },
     },
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
 };
-use jsonwebtoken::{Algorithm, EncodingKey, Header};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, jwk::JwkSet};
 use oauth_common::{
     Db, build_url, build_url_with_fragment, context, decode_client_credentials, param, pkce_challenge, random_string,
     render,
 };
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tokio::sync::Mutex;
 use tower_http::set_header::SetResponseHeaderLayer;
 use url::{Host, Url};
@@ -65,6 +65,37 @@ static SIGNING_KEY_ID: LazyLock<String> = LazyLock::new(|| {
     let jwks: Value = serde_json::from_str(JWKS).expect("keys/jwks.json is JSON");
     jwks["keys"][0]["kid"].as_str().expect("keys/jwks.json has a kid").to_string()
 });
+
+/// Checks our own signatures, for introspection.
+static VERIFYING_KEY: LazyLock<DecodingKey> = LazyLock::new(|| {
+    let jwks: JwkSet = serde_json::from_str(JWKS).expect("keys/jwks.json is a JWK Set");
+    DecodingKey::from_jwk(&jwks.keys[0]).expect("keys/jwks.json holds an RSA key")
+});
+
+// ---------------------------------------------------------------------------
+// Protected resources
+// ---------------------------------------------------------------------------
+
+/// A protected resource that may introspect the tokens meant for it.
+struct ProtectedResource {
+    resource_id: &'static str,
+    resource_secret: &'static str,
+    /// The `aud` of the tokens it's allowed to hear about.
+    audience: &'static str,
+}
+
+const PROTECTED_RESOURCES: &[ProtectedResource] = &[
+    ProtectedResource {
+        resource_id: "protected-resource-1",
+        resource_secret: "protected-resource-secret-1",
+        audience: PROTECTED_RESOURCE,
+    },
+    ProtectedResource {
+        resource_id: "protected-resource-2",
+        resource_secret: "protected-resource-secret-2",
+        audience: "http://localhost:9003/",
+    },
+];
 
 // ---------------------------------------------------------------------------
 // Registered clients
@@ -368,6 +399,21 @@ impl<'a> Grant<'a> {
 /// Seconds since 1970: the unit of `iat` and `exp`.
 fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// The claims of one of our access tokens, if the signature and the claims
+/// check out. Says nothing about whether it was revoked.
+fn verify_access_token(token: &str) -> Option<Map<String, Value>> {
+    let header = jsonwebtoken::decode_header(token).ok()?;
+    if header.typ.as_deref() != Some("at+jwt") || header.kid.as_deref() != Some(SIGNING_KEY_ID.as_str()) {
+        return None;
+    }
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.set_issuer(&[ISSUER]);
+    // which audience is fine depends on who's asking
+    validation.validate_aud = false;
+    validation.set_required_spec_claims(&["exp", "iss", "aud", "jti"]);
+    jsonwebtoken::decode(token, &VERIFYING_KEY, &validation).ok().map(|token| token.claims)
 }
 
 /// Deletes every token issued under a grant.
@@ -803,6 +849,46 @@ fn token_response(access_token: &str, refresh_token: Option<&str>, scope: &[Stri
 /// The scopes a grant without a user's approval page gets: the requested
 /// ones if they're all allowed, every allowed one if none were requested,
 /// or `None` if the client asked for one it may not have.
+/// `POST /introspect` (RFC 7662): tells a protected resource whether a token
+/// is active, and what it's good for.
+async fn introspect(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Form(body): Form<HashMap<String, String>>,
+) -> Response {
+    let resource = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(decode_client_credentials)
+        .and_then(|(id, secret)| {
+            PROTECTED_RESOURCES.iter().find(|r| r.resource_id == id && r.resource_secret == secret)
+        });
+    let Some(resource) = resource else {
+        println!("Introspection by someone who isn't a protected resource");
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(WWW_AUTHENTICATE, r#"Basic realm="introspection""#)],
+            Json(json!({ "error": "invalid_client" })),
+        )
+            .into_response();
+    };
+
+    let token = param(&body, "token");
+    let active = verify_access_token(token)
+        .filter(|claims| claims.get("aud").and_then(Value::as_str) == Some(resource.audience))
+        // revoked tokens' records are gone
+        .filter(|claims| claims.get("jti").is_some_and(|jti| app.db.find_one(|doc| doc["jti"] == *jti).is_some()));
+
+    let Some(mut answer) = active else {
+        println!("Introspection by {}: inactive token", resource.resource_id);
+        return Json(json!({ "active": false })).into_response();
+    };
+    println!("Introspection by {}: active token", resource.resource_id);
+    answer.insert("active".into(), json!(true));
+    answer.insert("token_type".into(), json!("Bearer"));
+    Json(answer).into_response()
+}
+
 fn requested_scope(client: &Client, body: &HashMap<String, String>) -> Option<Vec<String>> {
     let cscope = split_scope(&client.scope);
     match body.get("scope") {
@@ -916,8 +1002,10 @@ async fn main() {
     let state = AppState { inner: Arc::default(), db };
 
     // A token response is a credential: no cache may keep it (RFC 6749 §5.1).
+    // Neither may an introspection answer.
     let token_endpoint = Router::new()
         .route("/token", post(token))
+        .route("/introspect", post(introspect))
         .layer(set_header(CACHE_CONTROL, "no-store"))
         .layer(set_header(PRAGMA, "no-cache"));
 
