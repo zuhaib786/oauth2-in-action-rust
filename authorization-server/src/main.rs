@@ -30,7 +30,9 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
 };
-use oauth_common::{Db, build_url, context, decode_client_credentials, param, random_string, render};
+use oauth_common::{
+    Db, build_url, context, decode_client_credentials, param, random_string, render,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -100,7 +102,9 @@ static USERS: LazyLock<Vec<User>> = LazyLock::new(|| {
 });
 
 fn get_user(username: &str) -> Option<&'static User> {
-    USERS.iter().find(|user| user.preferred_username == username)
+    USERS
+        .iter()
+        .find(|user| user.preferred_username == username)
 }
 
 // ---------------------------------------------------------------------------
@@ -210,8 +214,22 @@ async fn authorize(
      *      app.inner.lock().await.requests under a new id, random_string(8)
      *   4. render("approve", context! { client => client, reqid => reqid, users => &*USERS })
      */
+    let Some(client) = get_client(param(&query, "client_id")) else {
+        return render("error", context! {error => "Unknown client"});
+    };
+    let redirect_uri = param(&query, "redirect_uri");
 
-    render("error", context! { error => "TODO: implement /authorize in authorization-server/src/main.rs" })
+    if !client.redirect_uris.iter().any(|uri| uri == redirect_uri) {
+        return render("error", context! {error => "Inavlid redirect uri"});
+    }
+    let mut inner = app.inner.lock().await;
+    let req_id = random_string(8);
+    inner.requests.insert(req_id.clone(), query.clone());
+
+    render(
+        "approve",
+        context! {client => client, reqid => req_id, users => &*USERS},
+    )
 }
 
 /// The approval page's form posts here when the user clicks Approve or Deny.
@@ -238,7 +256,51 @@ async fn approve(
      *      sent it, if it sent one.
      */
 
-    render("error", context! { error => "TODO: implement /approve in authorization-server/src/main.rs" })
+    let mut inner = app.inner.lock().await;
+    let Some(req_id) = form.get("reqid") else {
+        return render(
+            "error",
+            context! {error => "No matching authorization request"},
+        );
+    };
+
+    let Some(request) = inner.requests.remove(req_id) else {
+        return render(
+            "error",
+            context! {error => "No matching authorization request"},
+        );
+    };
+    // Else block should not fire?
+    let Some(redirect_uri) = request.get("redirect_uri") else {
+        return render("error", context! {error => "Inavlid redirect_uri"});
+    };
+
+    if !form.contains_key("approve") {
+        return redirect_with_error(redirect_uri, "access_denied");
+    }
+    if let Some(response_type) = request.get("response_type")
+        && response_type == "code"
+    {
+        let Some(user) = get_user(param(&form, "user")) else {
+            return render("error", context! {error => "Invalid user"});
+        };
+        let code = random_string(8);
+        let state = param(&request, "state");
+        inner.codes.insert(
+            code.clone(),
+            CodeInfo {
+                request: request.clone(),
+                scope: vec![], // This needs to be updated
+                user: user.preferred_username.clone(),
+            },
+        );
+        return Redirect::to(&build_url(
+            redirect_uri,
+            &[("code", &code), ("state", state)],
+        ))
+        .into_response();
+    }
+    redirect_with_error(redirect_uri, "unsupported_response_type")
 }
 
 /// The token endpoint. The client calls this directly (not through the
@@ -269,8 +331,56 @@ async fn token(
      * Tip: a separate `async fn authorization_code_grant(...)` for steps 3-5
      * keeps this tidy, and gives later grant types an obvious place to go.
      */
+    match get_client_id_and_client_secret(&headers, &body) {
+        Ok((client_id, client_secret)) => {
+            let Some(client) = get_client(&client_id) else {
+                return json_error(StatusCode::UNAUTHORIZED, "invalid_client");
+            };
+            if client.client_secret != client_secret {
+                return json_error(StatusCode::UNAUTHORIZED, "invalid_client"); // susceptible to timing attacks
+            }
+            if param(&body, "grant_type") != "authorization_code" {
+                return json_error(StatusCode::BAD_REQUEST, "unsupported_grant_type");
+            }
+            let Some(code_info) = app.inner.lock().await.codes.remove(param(&body, "code")) else {
+                return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
+            };
+            if param(&code_info.request, "client_id") != client_id {
+                return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
+            }
+            let access_token = random_string(32);
+            app.db.insert(json!({
+                "access_token": access_token,
+                "client_id": client_id,
+                "scope": code_info.scope,
+                "user": code_info.user,
+            }));
+            Json(json!({ "access_token": access_token, "token_type": "Bearer" })).into_response()
+        }
+        Err(response) => response,
+    }
+}
 
-    json_error(StatusCode::NOT_IMPLEMENTED, "TODO: implement /token")
+fn get_client_id_and_client_secret(
+    headers: &HeaderMap,
+    body: &HashMap<String, String>,
+) -> Result<(String, String), Response> {
+    if headers.contains_key("authorization")
+        && (body.contains_key("client_id") || body.contains_key("client_secret"))
+    {
+        return Err(json_error(StatusCode::UNAUTHORIZED, "invalid_client"));
+    }
+    if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok())
+        && let Some(credentials) = decode_client_credentials(auth)
+    {
+        return Ok(credentials);
+    }
+    if let Some(c_id) = body.get("client_id")
+        && let Some(c_sec) = body.get("client_secret")
+    {
+        return Ok((c_id.clone(), c_sec.clone()));
+    }
+    Err(json_error(StatusCode::UNAUTHORIZED, "invalid_client"))
 }
 
 #[tokio::main]
@@ -281,7 +391,10 @@ async fn main() {
     // clear the database on startup
     db.clear();
 
-    let state = AppState { inner: Arc::default(), db };
+    let state = AppState {
+        inner: Arc::default(),
+        db,
+    };
 
     let app = Router::new()
         .route("/", get(index))
