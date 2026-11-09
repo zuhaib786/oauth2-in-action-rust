@@ -343,11 +343,42 @@ async fn token(
          *   - issues and saves a new access token for the same client and user
          *   - answers with the new access token and the same refresh token
          */
+        "refresh_token" => refresh_token_grant(&app, client, &body),
         other => {
             println!("Unknown grant type {other}");
             json_error(StatusCode::BAD_REQUEST, "unsupported_grant_type")
         }
     }
+}
+
+fn refresh_token_grant(
+    app: &AppState,
+    client: &Client,
+    body: &HashMap<String, String>,
+) -> Response {
+    let Some(refresh_token) = body.get("refresh_token") else {
+        println!("Refresh token not set");
+        return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
+    };
+    let Some(doc) = app
+        .db
+        .find_one(|doc| &doc["refresh_token"] == refresh_token)
+    else {
+        println!("Invalid refresh token: {}", refresh_token);
+        return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
+    };
+
+    // found the refresh token
+    if doc["client_id"] != client.client_id {
+        app.db.remove(|doc| &doc["refresh_token"] == refresh_token);
+        return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
+    }
+    // refresh token belongs to the intended client
+    let access_token = random_string(32);
+    app.db.insert(json!({"client_id": client.client_id, "scope": doc["scope"], "access_token": access_token, "user": doc["user"]}));
+    Json(
+        json!({"access_token": access_token, "refresh_token": refresh_token, "token_type": "Bearer"})
+        ).into_response()
 }
 
 /// grant_type=authorization_code: trade a code from /approve for a token.
@@ -387,11 +418,17 @@ async fn authorization_code_grant(
      * it in the response.
      */
 
+    let refresh_token = random_string(32);
+    app.db.insert(
+        json!({"refresh_token": &refresh_token, "client_id": client.client_id, "scope": code.scope, "user": code.user})
+        );
+
     println!("Issuing access token {access_token}");
     println!("Issued tokens for code {code_value}");
 
     Json(json!({
         "access_token": access_token,
+        "refresh_token": refresh_token,
         "token_type": "Bearer",
     }))
     .into_response()
