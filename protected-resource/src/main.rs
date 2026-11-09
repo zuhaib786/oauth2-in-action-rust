@@ -65,7 +65,10 @@ fn get_access_token(
         query.get("access_token").cloned()
     };
 
-    println!("Incoming token: {}", in_token.as_deref().unwrap_or("(none)"));
+    println!(
+        "Incoming token: {}",
+        in_token.as_deref().unwrap_or("(none)")
+    );
     let in_token = in_token?;
 
     let found = db.find_one(|doc| doc["access_token"] == in_token.as_str());
@@ -133,7 +136,9 @@ async fn resource(_token: AccessToken) -> Response {
 
 /// Milliseconds since 1970, like JavaScript's `Date.now()`.
 fn now_millis() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 /// 403 Forbidden, telling the client which scope it was missing.
@@ -207,15 +212,22 @@ async fn favorites(token: AccessToken) -> Response {
      *     Alice, the same with "Bob" for Bob
      */
 
-    let unknown = json!({ "user": "Unknown", "favorites": { "movies": [], "foods": [], "music": [] } });
-    Json(unknown).into_response()
+    let response = match token.record["user"].as_str() {
+        Some("alice") => json!({"user": "Alice", "favorites" : alice_favorites}),
+        Some("bob") => json!({"user": "Bob", "favorites": bob_favorites}),
+        _ => json!({"user": "Unknown", "favorites": {"movies": [], "food": [], "music": []}}),
+    };
+    Json(response).into_response()
 }
 
 #[tokio::main]
 async fn main() {
     oauth_common::set_views_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/templates"));
 
-    let state = AppState { db: Db::shared(), saved_words: Arc::default() };
+    let state = AppState {
+        db: Db::shared(),
+        saved_words: Arc::default(),
+    };
 
     let app = Router::new()
         .route("/", get(|| async { render("index", context! {}) }))
