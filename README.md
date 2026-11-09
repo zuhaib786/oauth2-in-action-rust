@@ -133,6 +133,7 @@ outside (how you store passwords, say). The spec marks those "not tested".
 | 11-4 | `ch11-ex4` | Token introspection: an authenticated `/introspect` that knows about revocation, and a resource that asks it | [spec](exercises/ch11-ex4.md) | [start](https://github.com/zuhaib786/oauth2-in-action-rust/tree/ch11-ex4-start) · [solution](https://github.com/zuhaib786/oauth2-in-action-rust/compare/ch11-ex4-start...ch11-ex4-done) |
 | 11-5 | `ch11-ex5` | Token revocation, refresh token rotation with reuse detection, and a Revoke button in the client | [spec](exercises/ch11-ex5.md) | [start](https://github.com/zuhaib786/oauth2-in-action-rust/tree/ch11-ex5-start) · [solution](https://github.com/zuhaib786/oauth2-in-action-rust/compare/ch11-ex5-start...ch11-ex5-done) |
 | 12-1 | `ch12-ex1` | Dynamic client registration: a `/register` that treats metadata as hostile input, enforced auth methods, and a client that registers itself | [spec](exercises/ch12-ex1.md) | [start](https://github.com/zuhaib786/oauth2-in-action-rust/tree/ch12-ex1-start) · [solution](https://github.com/zuhaib786/oauth2-in-action-rust/compare/ch12-ex1-start...ch12-ex1-done) |
+| 12-2 | `ch12-ex2` | Registration management: read, replace and delete a registration with its own access token | [spec](exercises/ch12-ex2.md) | [start](https://github.com/zuhaib786/oauth2-in-action-rust/tree/ch12-ex2-start) · [solution](https://github.com/zuhaib786/oauth2-in-action-rust/compare/ch12-ex2-start...ch12-ex2-done) |
 
 ### One reader's solutions
 
