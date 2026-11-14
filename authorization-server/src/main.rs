@@ -69,6 +69,13 @@ static CLIENTS: LazyLock<Vec<Client>> = LazyLock::new(|| {
             scope: "foo bar".into(),
             grant_types: vec!["implicit".into()],
         },
+        Client {
+            client_id: "oauth-client-service".into(),
+            client_secret: Some("oauth-client-secret-service".into()),
+            redirect_uris: vec![],
+            scope: "read write".into(),
+            grant_types: vec!["client_credentials".into()],
+        },
     ]
 });
 
@@ -104,7 +111,7 @@ impl ResponseType {
 }
 
 /// The grant types the token endpoint knows.
-const TOKEN_GRANT_TYPES: &[&str] = &["authorization_code", "refresh_token"];
+const TOKEN_GRANT_TYPES: &[&str] = &["authorization_code", "refresh_token", "client_credentials"];
 
 // ---------------------------------------------------------------------------
 // Users (resource owners)
@@ -454,6 +461,10 @@ async fn token(
 
     // --- Which grant type is the client using, and may it? ---
     let grant_type = param(&body, "grant_type");
+    if grant_type == "client_credentials" && client.client_secret.is_none() {
+        println!("Public Client {client_id} is asking for CCG");
+        return json_error(StatusCode::UNAUTHORIZED, "invalid_client");
+    }
     if !TOKEN_GRANT_TYPES.contains(&grant_type) {
         println!("Unknown grant type {grant_type}");
         return json_error(StatusCode::BAD_REQUEST, "unsupported_grant_type");
@@ -466,6 +477,7 @@ async fn token(
     match grant_type {
         "authorization_code" => authorization_code_grant(&app, client, &body).await,
         "refresh_token" => refresh_token_grant(&app, client, &body),
+        "client_credentials" => client_credentials_grant(&app, client, &body),
         _ => unreachable!("checked against TOKEN_GRANT_TYPES"),
     }
 }
@@ -553,6 +565,37 @@ fn refresh_token_grant(
         "token_type": "Bearer",
         "refresh_token": refresh_token,
         "scope": scope_to_string(&token["scope"]),
+    }))
+    .into_response()
+}
+
+/// grant_type=client_credentials: the client gets a token for itself, with no
+/// user and no refresh token (RFC 6749 §4.4). `/token` has already checked that
+/// it's a confidential client and is registered for this grant.
+fn client_credentials_grant(
+    app: &AppState,
+    client: &Client,
+    body: &HashMap<String, String>,
+) -> Response {
+    let cscope = split_scope(&client.scope);
+    // no scope (or an empty one) means everything the client may have (§3.3)
+    let mut rscope = split_scope(param(body, "scope"));
+    if rscope.is_empty() {
+        rscope = cscope.clone();
+    }
+
+    if has_extra_scope(&rscope, &cscope) {
+        println!(
+            "Got extra scopes, allowed: {:?}, requested: {:?}",
+            &cscope, &rscope
+        );
+        return json_error(StatusCode::BAD_REQUEST, "invalid_scope");
+    }
+    let access_token = issue_access_token(&app.db, client, &rscope, None);
+    Json(json! ({
+         "access_token": access_token,
+         "token_type": "Bearer",
+         "scope": rscope.join(" "),
     }))
     .into_response()
 }
