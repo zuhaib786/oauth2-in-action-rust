@@ -19,7 +19,8 @@ use axum::{
     routing::{get, post},
 };
 use oauth_common::{
-    Db, build_url, context, decode_client_credentials, param, random_string, render,
+    Db, build_url, build_url_with_fragment, context, decode_client_credentials, param,
+    random_string, render,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -33,23 +34,51 @@ const TOKEN_ENDPOINT: &str = "http://localhost:9001/token";
 // Registered clients
 // ---------------------------------------------------------------------------
 
+/// What a client must show at the token endpoint to prove who it is.
+#[derive(Clone, Debug, Serialize)]
+#[serde(untagged)]
+enum ClientSecret {
+    /// A public client: it has no secret, so it sends only its `client_id`.
+    Unauthenticated,
+    Secret(String),
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct Client {
     client_id: String,
-    client_secret: String,
+    client_secret: ClientSecret,
     redirect_uris: Vec<String>,
     /// The scopes this client may ask for, separated by spaces.
     scope: String,
+    grant_types: Vec<String>,
 }
 
 static CLIENTS: LazyLock<Vec<Client>> = LazyLock::new(|| {
-    vec![Client {
-        client_id: "oauth-client-1".into(),
-        client_secret: "oauth-client-secret-1".into(),
-        redirect_uris: vec!["http://localhost:9000/callback".into()],
-        scope: "foo bar read write delete fruit veggies meats movies foods music".into(),
-    }]
+    vec![
+        Client {
+            client_id: "oauth-client-1".into(),
+            client_secret: ClientSecret::Secret("oauth-client-secret-1".into()),
+            redirect_uris: vec!["http://localhost:9000/callback".into()],
+            scope: "foo bar read write delete fruit veggies meats movies foods music".into(),
+            grant_types: vec!["refresh_token".into(), "authorization_code".into()],
+        },
+        Client {
+            client_id: "oauth-client-implicit".into(),
+            client_secret: ClientSecret::Unauthenticated,
+            redirect_uris: vec!["http://localhost:9000/implicit".into()],
+            scope: "foo bar".into(),
+            grant_types: vec!["implicit".into()],
+        },
+    ]
 });
+
+impl Client {
+    /// True if this client is registered for `grant_type` ("authorization_code",
+    /// "implicit", "refresh_token").
+    fn allows(&self, grant_type: &str) -> bool {
+        self.grant_types.iter().any(|grant| grant == grant_type)
+    }
+}
 
 fn get_client(client_id: &str) -> Option<&'static Client> {
     CLIENTS.iter().find(|client| client.client_id == client_id)
@@ -156,9 +185,35 @@ fn scopes_from_form(form: &HashMap<String, String>) -> Vec<String> {
     scopes
 }
 
-/// Sends the browser back to the client's redirect URI with `?error=...`.
-fn redirect_with_error(redirect_uri: &str, error: &str) -> Response {
-    Redirect::to(&build_url(redirect_uri, &[("error", error)])).into_response()
+/// Sends the browser back to the client's redirect URI with `params`, plus the
+/// request's `state` if it had one (RFC 6749 §4.1.2).
+///
+/// `request` is the /authorize query, and its `redirect_uri` must already have
+/// been checked against the client's. Everything else comes from it too: the
+/// implicit grant (`response_type=token`) puts the parameters in the fragment
+/// (§4.2.2), so the browser never sends them to the client's server; every
+/// other response puts them in the query.
+fn redirect_back(request: &HashMap<String, String>, params: &[(&str, &str)]) -> Response {
+    let mut params = params.to_vec();
+    if let Some(state) = request.get("state") {
+        params.push(("state", state.as_str()));
+    }
+
+    let redirect_uri = param(request, "redirect_uri");
+    let location = if param(request, "response_type") == "token" {
+        let fragment = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(&params)
+            .finish();
+        build_url_with_fragment(redirect_uri, &[], &fragment)
+    } else {
+        build_url(redirect_uri, &params)
+    };
+    Redirect::to(&location).into_response()
+}
+
+/// [`redirect_back`] with `error=...`, e.g. `access_denied` (§4.1.2.1, §4.2.2.1).
+fn redirect_with_error(request: &HashMap<String, String>, error: &str) -> Response {
+    redirect_back(request, &[("error", error)])
 }
 
 /// A JSON error response from the token endpoint, e.g. `{"error": "invalid_grant"}`.
@@ -193,7 +248,11 @@ async fn authorize(
 
     let Some(client) = get_client(client_id) else {
         println!("Unknown client {client_id}");
-        return render("error", context! { error => "Unknown client" });
+        return (
+            StatusCode::BAD_REQUEST,
+            render("error", context! {error => "Unknown client"}),
+        )
+            .into_response();
     };
 
     if !client.redirect_uris.iter().any(|uri| uri == redirect_uri) {
@@ -201,14 +260,27 @@ async fn authorize(
             "Mismatched redirect URI, expected {:?} got {redirect_uri}",
             client.redirect_uris
         );
-        return render("error", context! { error => "Invalid redirect URI" });
+        return (
+            StatusCode::BAD_REQUEST,
+            render("error", context! {error => "Invalid Rdirect uri"}),
+        )
+            .into_response();
+    }
+    // From here on the redirect URI is trusted, so errors go back to the client.
+    let grant_type = match param(&query, "response_type") {
+        "code" => "authorization_code",
+        "token" => "implicit",
+        _ => return redirect_with_error(&query, "unsupported_response_type"),
+    };
+    if !client.allows(grant_type) {
+        return redirect_with_error(&query, "unauthorized_client");
     }
 
     let rscope = split_scope(param(&query, "scope"));
     let cscope = split_scope(&client.scope);
     if has_extra_scope(&rscope, &cscope) {
         // client asked for a scope it couldn't have
-        return redirect_with_error(redirect_uri, "invalid_scope");
+        return redirect_with_error(&query, "invalid_scope");
     }
 
     let reqid = random_string(8);
@@ -229,25 +301,24 @@ async fn approve(
     State(app): State<AppState>,
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
-    let mut state = app.inner.lock().await;
+    let mut app_state = app.inner.lock().await;
 
-    let Some(query) = state.requests.remove(param(&form, "reqid")) else {
+    let Some(query) = app_state.requests.remove(param(&form, "reqid")) else {
         // there was no matching saved request, this is an error
         return render(
             "error",
             context! { error => "No matching authorization request" },
         );
     };
-    let redirect_uri = param(&query, "redirect_uri");
-
     if !form.contains_key("approve") {
         // user denied access
-        return redirect_with_error(redirect_uri, "access_denied");
+        return redirect_with_error(&query, "access_denied");
     }
 
-    if param(&query, "response_type") != "code" {
+    let response_type = param(&query, "response_type");
+    if !matches!(response_type, "code" | "token") {
         // we got a response type we don't understand
-        return redirect_with_error(redirect_uri, "unsupported_response_type");
+        return redirect_with_error(&query, "unsupported_response_type");
     }
 
     // user approved access
@@ -262,23 +333,42 @@ async fn approve(
 
     let scope = scopes_from_form(&form);
     let client = get_client(param(&query, "client_id")).expect("client was checked in /authorize");
+
     if has_extra_scope(&scope, &split_scope(&client.scope)) {
         // client asked for a scope it couldn't have
-        return redirect_with_error(redirect_uri, "invalid_scope");
+        return redirect_with_error(&query, "invalid_scope");
+    }
+
+    if response_type == "token" {
+        // implicit grant: the token goes straight back, with no code and no
+        // refresh token (RFC 6749 §4.2.2)
+        let access_token = random_string(32);
+        app.db.insert(json!({
+            "access_token": access_token,
+            "client_id": client.client_id,
+            "scope": scope,
+            "user": user.preferred_username,
+        }));
+
+        let scope = scope.join(" ");
+        println!("Issuing access token {access_token} with scope {scope}");
+        return redirect_back(
+            &query,
+            &[
+                ("access_token", access_token.as_str()),
+                ("token_type", "Bearer"),
+                ("scope", scope.as_str()),
+            ],
+        );
     }
 
     let code = random_string(8);
-
-    // The client must get back exactly the `state` it sent us.
-    let mut params = vec![("code", code.as_str())];
-    if let Some(client_state) = query.get("state") {
-        params.push(("state", client_state));
-    }
-    let location = build_url(redirect_uri, &params);
+    // build the redirect first: saving the code below moves `query` into it
+    let response = redirect_back(&query, &[("code", code.as_str())]);
 
     // save the code and request for later
-    state.codes.insert(
-        code.clone(),
+    app_state.codes.insert(
+        code,
         CodeInfo {
             request: query,
             scope,
@@ -286,7 +376,7 @@ async fn approve(
         },
     );
 
-    Redirect::to(&location).into_response()
+    response
 }
 
 /// The token endpoint. The client calls this directly (not through the
@@ -325,9 +415,14 @@ async fn token(
         return json_error(StatusCode::UNAUTHORIZED, "invalid_client");
     };
 
-    if client_secret.as_deref() != Some(client.client_secret.as_str()) {
+    let secret_matches = match (&client.client_secret, &client_secret) {
+        (ClientSecret::Unauthenticated, None) => true,
+        (ClientSecret::Secret(expected), Some(given)) => expected == given,
+        _ => false,
+    };
+    if !secret_matches {
         println!(
-            "Mismatched client secret, expected {} got {client_secret:?}",
+            "Mismatched client secret, expected {:?} got {client_secret:?}",
             client.client_secret
         );
         return json_error(StatusCode::UNAUTHORIZED, "invalid_client");
@@ -335,6 +430,11 @@ async fn token(
 
     // --- Which grant type is the client using? ---
     match param(&body, "grant_type") {
+        // a grant type we know, but this client isn't registered for
+        grant @ ("authorization_code" | "refresh_token") if !client.allows(grant) => {
+            println!("Client {} may not use {grant}", client.client_id);
+            json_error(StatusCode::BAD_REQUEST, "unauthorized_client")
+        }
         "authorization_code" => authorization_code_grant(&app, client, &body).await,
         "refresh_token" => refresh_token_grant(&app, client, &body),
         other => {
