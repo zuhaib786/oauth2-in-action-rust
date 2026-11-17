@@ -8,6 +8,7 @@
 
 use std::{
     collections::HashMap,
+    net::{Ipv4Addr, Ipv6Addr},
     sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
@@ -21,7 +22,8 @@ use axum::{
     routing::{get, post},
 };
 use oauth_common::{
-    Db, build_url, build_url_with_fragment, context, decode_client_credentials, param, random_string, render,
+    Db, build_url, build_url_with_fragment, context, decode_client_credentials, param,
+    random_string, render,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -84,8 +86,48 @@ static CLIENTS: LazyLock<Vec<Client>> = LazyLock::new(|| {
             scope: "foo bar read write".into(),
             grant_types: vec!["password".into(), "refresh_token".into()],
         },
+        Client {
+            client_id: "oauth-native-client".into(),
+            client_secret: None,
+            redirect_uris: vec!["http://127.0.0.1/callback".into()],
+            scope: "foo bar".into(),
+            grant_types: vec!["authorization_code".into(), "refresh_token".into()],
+        },
     ]
 });
+
+fn is_loopback_url(redirect_url: &str) -> bool {
+    let Ok(url_parsed) = url::Url::parse(redirect_url) else {
+        return false;
+    };
+    let scheme = url_parsed.scheme();
+    let host = url_parsed.host();
+    if scheme == "http"
+        && (host == Some(url::Host::Ipv4(Ipv4Addr::LOCALHOST))
+            || host == Some(url::Host::Ipv6(Ipv6Addr::LOCALHOST)))
+    {
+        return true;
+    }
+    false
+}
+fn eq_redirect_uri(given: &str, present: &str) -> bool {
+    if is_loopback_url(given) && is_loopback_url(present) {
+        let Ok(given_parsed) = url::Url::parse(given) else {
+            return false;
+        };
+        let Ok(present_parsed) = url::Url::parse(present) else {
+            return false;
+        };
+        if present_parsed.path() == given_parsed.path()
+            && given_parsed.query().is_none()
+            && given_parsed.fragment().is_none()
+            && given_parsed.host() == present_parsed.host()
+        {
+            return true;
+        }
+    }
+    present == given
+}
 
 fn get_client(client_id: &str) -> Option<&'static Client> {
     CLIENTS.iter().find(|client| client.client_id == client_id)
@@ -119,7 +161,12 @@ impl ResponseType {
 }
 
 /// The grant types the token endpoint knows.
-const TOKEN_GRANT_TYPES: &[&str] = &["authorization_code", "refresh_token", "client_credentials", "password"];
+const TOKEN_GRANT_TYPES: &[&str] = &[
+    "authorization_code",
+    "refresh_token",
+    "client_credentials",
+    "password",
+];
 
 // ---------------------------------------------------------------------------
 // Users (resource owners)
@@ -170,20 +217,24 @@ static USERS: LazyLock<Vec<User>> = LazyLock::new(|| {
 });
 
 fn get_user(username: &str) -> Option<&'static User> {
-    USERS.iter().find(|user| user.preferred_username == username)
+    USERS
+        .iter()
+        .find(|user| user.preferred_username == username)
 }
 
 /// Checked when the username is unknown, so that takes as long as a wrong
 /// password and the response time doesn't say which usernames exist.
-const DUMMY_PASSWORD_HASH: &str =
-    "$argon2id$v=19$m=19456,t=2,p=1$0eFanii02Ip3tLiUwqjjGQ$lZxOlwPFr0XHN2F8pobLuJzdFbnszgK3YO/ZoZbHzxM";
+const DUMMY_PASSWORD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$0eFanii02Ip3tLiUwqjjGQ$lZxOlwPFr0XHN2F8pobLuJzdFbnszgK3YO/ZoZbHzxM";
 
 /// Checks a password against a PHC hash string. Argon2 is slow on purpose,
 /// so this runs on a thread meant for blocking work, not on the async runtime.
 async fn password_matches(hash: &'static str, password: String) -> bool {
     tokio::task::spawn_blocking(move || {
-        PasswordHash::new(hash)
-            .is_ok_and(|hash| Argon2::default().verify_password(password.as_bytes(), &hash).is_ok())
+        PasswordHash::new(hash).is_ok_and(|hash| {
+            Argon2::default()
+                .verify_password(password.as_bytes(), &hash)
+                .is_ok()
+        })
     })
     .await
     .unwrap_or(false)
@@ -301,7 +352,9 @@ fn redirect_back(
     }
 
     let location = if response_type == Some(ResponseType::Token) {
-        let fragment = url::form_urlencoded::Serializer::new(String::new()).extend_pairs(&params).finish();
+        let fragment = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(&params)
+            .finish();
         build_url_with_fragment(redirect_uri, &[], &fragment)
     } else {
         build_url(redirect_uri, &params)
@@ -351,8 +404,15 @@ async fn authorize(
         return error_page("Unknown client");
     };
 
-    if !client.redirect_uris.iter().any(|uri| uri == redirect_uri) {
-        println!("Mismatched redirect URI, expected {:?} got {redirect_uri}", client.redirect_uris);
+    if !client
+        .redirect_uris
+        .iter()
+        .any(|uri| eq_redirect_uri(redirect_uri, uri))
+    {
+        println!(
+            "Mismatched redirect URI, expected {:?} got {redirect_uri}",
+            client.redirect_uris
+        );
         return error_page("Invalid redirect URI");
     }
 
@@ -362,8 +422,15 @@ async fn authorize(
     };
 
     if !client.allows_grant(response_type.grant_type()) {
-        println!("Client {client_id} may not use the {} grant", response_type.grant_type());
-        return redirect_back(&query, Some(response_type), &[("error", "unauthorized_client")]);
+        println!(
+            "Client {client_id} may not use the {} grant",
+            response_type.grant_type()
+        );
+        return redirect_back(
+            &query,
+            Some(response_type),
+            &[("error", "unauthorized_client")],
+        );
     }
 
     let rscope = split_scope(param(&query, "scope"));
@@ -374,7 +441,11 @@ async fn authorize(
     }
 
     let reqid = random_string(8);
-    app.inner.lock().await.requests.insert(reqid.clone(), query.clone());
+    app.inner
+        .lock()
+        .await
+        .requests
+        .insert(reqid.clone(), query.clone());
 
     render(
         "approve",
@@ -419,18 +490,30 @@ async fn approve(
             let code = random_string(8);
             let response = redirect_back(&query, response_type, &[("code", &code)]);
             // save the code and request for later
-            state.codes.insert(code, CodeInfo { request: query, scope, user: user.preferred_username.clone() });
+            state.codes.insert(
+                code,
+                CodeInfo {
+                    request: query,
+                    scope,
+                    user: user.preferred_username.clone(),
+                },
+            );
             response
         }
         Some(ResponseType::Token) => {
             // The implicit grant: the token goes straight back to the browser,
             // and never with a refresh token (RFC 6749 §4.2.2).
-            let access_token = issue_access_token(&app.db, client, &scope, Some(&user.preferred_username));
+            let access_token =
+                issue_access_token(&app.db, client, &scope, Some(&user.preferred_username));
             let scope = scope.join(" ");
             redirect_back(
                 &query,
                 response_type,
-                &[("access_token", &access_token), ("token_type", "Bearer"), ("scope", &scope)],
+                &[
+                    ("access_token", &access_token),
+                    ("token_type", "Bearer"),
+                    ("scope", &scope),
+                ],
             )
         }
         None => unreachable!("/authorize only saves requests with a known response_type"),
@@ -446,7 +529,10 @@ fn issue_access_token(db: &Db, client: &Client, scope: &[String], user: Option<&
         "scope": scope,
         "user": user,
     }));
-    println!("Issuing access token {access_token} with scope {}", scope.join(" "));
+    println!(
+        "Issuing access token {access_token} with scope {}",
+        scope.join(" ")
+    );
     access_token
 }
 
@@ -462,7 +548,10 @@ async fn token(
     let mut client_secret = None;
 
     // check the auth header
-    let basic = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(decode_client_credentials);
+    let basic = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(decode_client_credentials);
     if let Some((id, secret)) = basic {
         client_id = Some(id);
         client_secret = Some(secret);
@@ -533,7 +622,10 @@ async fn authorization_code_grant(
 
     let code_client_id = param(&code.request, "client_id");
     if code_client_id != client.client_id {
-        println!("Client mismatch, expected {code_client_id} got {}", client.client_id);
+        println!(
+            "Client mismatch, expected {code_client_id} got {}",
+            client.client_id
+        );
         return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
     }
 
@@ -585,7 +677,11 @@ fn requested_scope(client: &Client, body: &HashMap<String, String>) -> Option<Ve
 
 /// grant_type=refresh_token: trade a refresh token for a new access token,
 /// without bothering the user again.
-fn refresh_token_grant(app: &AppState, client: &Client, body: &HashMap<String, String>) -> Response {
+fn refresh_token_grant(
+    app: &AppState,
+    client: &Client,
+    body: &HashMap<String, String>,
+) -> Response {
     let refresh_token = param(body, "refresh_token");
 
     let Some(token) = app.db.find_one(|doc| doc["refresh_token"] == refresh_token) else {
@@ -596,7 +692,10 @@ fn refresh_token_grant(app: &AppState, client: &Client, body: &HashMap<String, S
 
     if token["client_id"] != client.client_id.as_str() {
         // Someone is using another client's refresh token. Revoke it.
-        println!("Invalid client using a refresh token, expected {} got {}", token["client_id"], client.client_id);
+        println!(
+            "Invalid client using a refresh token, expected {} got {}",
+            token["client_id"], client.client_id
+        );
         app.db.remove(|doc| doc["refresh_token"] == refresh_token);
         return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
     }
@@ -609,15 +708,25 @@ fn refresh_token_grant(app: &AppState, client: &Client, body: &HashMap<String, S
 
 /// grant_type=client_credentials: the client gets a token for itself. No
 /// user is involved, so the token has none.
-fn client_credentials_grant(app: &AppState, client: &Client, body: &HashMap<String, String>) -> Response {
+fn client_credentials_grant(
+    app: &AppState,
+    client: &Client,
+    body: &HashMap<String, String>,
+) -> Response {
     if client.client_secret.is_none() {
         // Anyone can send a public client's id, so it can't get tokens on its own (RFC 6749 §4.4).
-        println!("Public client {} tried the client credentials grant", client.client_id);
+        println!(
+            "Public client {} tried the client credentials grant",
+            client.client_id
+        );
         return json_error(StatusCode::BAD_REQUEST, "unauthorized_client");
     }
 
     let Some(scope) = requested_scope(client, body) else {
-        println!("Client {} asked for scopes it may not have", client.client_id);
+        println!(
+            "Client {} asked for scopes it may not have",
+            client.client_id
+        );
         return json_error(StatusCode::BAD_REQUEST, "invalid_scope");
     };
 
@@ -629,11 +738,18 @@ fn client_credentials_grant(app: &AppState, client: &Client, body: &HashMap<Stri
 /// grant_type=password: the client sends the user's own username and
 /// password. Deprecated (RFC 9700 §2.4), and the reason this server has to
 /// handle passwords at all.
-async fn password_grant(app: &AppState, client: &Client, body: &HashMap<String, String>) -> Response {
+async fn password_grant(
+    app: &AppState,
+    client: &Client,
+    body: &HashMap<String, String>,
+) -> Response {
     let username = param(body, "username");
 
     let Some(scope) = requested_scope(client, body) else {
-        println!("Client {} asked for scopes it may not have", client.client_id);
+        println!(
+            "Client {} asked for scopes it may not have",
+            client.client_id
+        );
         return json_error(StatusCode::BAD_REQUEST, "invalid_scope");
     };
 
@@ -648,7 +764,10 @@ async fn password_grant(app: &AppState, client: &Client, body: &HashMap<String, 
     let password_ok = password_matches(hash, param(body, "password").to_string()).await;
 
     let user = user.filter(|_| password_ok);
-    app.inner.lock().await.record_login(username, user.is_some());
+    app.inner
+        .lock()
+        .await
+        .record_login(username, user.is_some());
 
     // The same answer for an unknown user and a wrong password.
     let Some(user) = user else {
@@ -671,7 +790,10 @@ async fn main() {
     // clear the database on startup
     db.clear();
 
-    let state = AppState { inner: Arc::default(), db };
+    let state = AppState {
+        inner: Arc::default(),
+        db,
+    };
 
     let app = Router::new()
         .route("/", get(index))
