@@ -8,6 +8,7 @@
 
 use std::{
     collections::HashMap,
+    net::{Ipv4Addr, Ipv6Addr},
     sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
@@ -85,8 +86,48 @@ static CLIENTS: LazyLock<Vec<Client>> = LazyLock::new(|| {
             scope: "foo bar read write".into(),
             grant_types: vec!["password".into(), "refresh_token".into()],
         },
+        Client {
+            client_id: "oauth-native-client".into(),
+            client_secret: None,
+            redirect_uris: vec!["http://127.0.0.1/callback".into()],
+            scope: "foo bar".into(),
+            grant_types: vec!["authorization_code".into(), "refresh_token".into()],
+        },
     ]
 });
+
+fn is_loopback_url(redirect_url: &str) -> bool {
+    let Ok(url_parsed) = url::Url::parse(redirect_url) else {
+        return false;
+    };
+    let scheme = url_parsed.scheme();
+    let host = url_parsed.host();
+    if scheme == "http"
+        && (host == Some(url::Host::Ipv4(Ipv4Addr::LOCALHOST))
+            || host == Some(url::Host::Ipv6(Ipv6Addr::LOCALHOST)))
+    {
+        return true;
+    }
+    false
+}
+fn eq_redirect_uri(given: &str, present: &str) -> bool {
+    if is_loopback_url(given) && is_loopback_url(present) {
+        let Ok(given_parsed) = url::Url::parse(given) else {
+            return false;
+        };
+        let Ok(present_parsed) = url::Url::parse(present) else {
+            return false;
+        };
+        if present_parsed.path() == given_parsed.path()
+            && given_parsed.query().is_none()
+            && given_parsed.fragment().is_none()
+            && given_parsed.host() == present_parsed.host()
+        {
+            return true;
+        }
+    }
+    present == given
+}
 
 fn get_client(client_id: &str) -> Option<&'static Client> {
     CLIENTS.iter().find(|client| client.client_id == client_id)
@@ -363,7 +404,11 @@ async fn authorize(
         return error_page("Unknown client");
     };
 
-    if !client.redirect_uris.iter().any(|uri| uri == redirect_uri) {
+    if !client
+        .redirect_uris
+        .iter()
+        .any(|uri| eq_redirect_uri(redirect_uri, uri))
+    {
         println!(
             "Mismatched redirect URI, expected {:?} got {redirect_uri}",
             client.redirect_uris
