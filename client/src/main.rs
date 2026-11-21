@@ -10,14 +10,17 @@
 use std::{collections::HashMap, sync::Arc};
 
 use axum::{
-    Router,
-    extract::{Query, State},
+    Extension, Router,
+    extract::{Query, Request, State},
+    http::{HeaderValue, header},
+    middleware::{self, Next},
     response::{IntoResponse, Redirect, Response},
     routing::get,
 };
+use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use oauth_common::{build_url, context, encode_client_credentials, param, random_string, render};
+use reqwest::StatusCode;
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
 
 // authorization server information
 struct AuthServer {
@@ -55,34 +58,66 @@ const FAVORITES_API: &str = "http://localhost:9002/favorites";
 /// Here they live in one struct behind a lock that every handler can reach
 /// through `State(app)`. `Option<String>` plays the role of "string or null".
 #[derive(Default)]
-struct ClientState {
-    state: Option<String>,
+struct Session {
+    state: Option<String>, // The session state
     access_token: Option<String>,
     scope: Option<String>,
     refresh_token: Option<String>,
 }
+type SessionRef = Arc<tokio::sync::Mutex<Session>>;
+type Sessions = Arc<std::sync::Mutex<HashMap<String, SessionRef>>>;
 
-type AppState = Arc<Mutex<ClientState>>;
+async fn with_session(
+    State(sessions): State<Sessions>,
+    jar: CookieJar,
+    mut req: Request,
+    next: Next,
+) -> (CookieJar, Response) {
+    let existing: Option<SessionRef> = jar
+        .get("session")
+        .and_then(|c| sessions.lock().unwrap().get(c.value()).cloned());
+
+    let (session, jar) = match existing {
+        Some(session) => (session, jar),
+        None => {
+            let id = random_string(32); // maybe more that that but fine for now
+            let cookie = Cookie::build(("session", id.clone()))
+                .http_only(true)
+                .same_site(SameSite::Lax)
+                .path("/");
+            let session = SessionRef::default();
+            sessions.lock().unwrap().insert(id, session.clone());
+            (session, jar.add(cookie))
+        }
+    };
+    req.extensions_mut().insert(session);
+    let mut res = next.run(req).await;
+    res.headers_mut().insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    (jar, res)
+}
 
 /// The home page, showing the tokens we currently hold.
-fn show_tokens(s: &ClientState) -> Response {
+fn show_tokens(s: &Session) -> Response {
     render(
         "index",
         context! { access_token => s.access_token, scope => s.scope, refresh_token => s.refresh_token },
     )
 }
 
-async fn index(State(app): State<AppState>) -> Response {
-    show_tokens(&*app.lock().await)
+async fn index(Extension(session): Extension<SessionRef>) -> Response {
+    show_tokens(&*session.lock().await)
 }
 
-async fn authorize(State(app): State<AppState>) -> Response {
-    let mut s = app.lock().await;
+async fn authorize(Extension(session): Extension<SessionRef>) -> Response {
+    let mut s = session.lock().await;
     s.access_token = None;
     s.scope = None;
 
     let state = random_string(32);
-    s.state = Some(state.clone());
+    s.state = Some(state.clone()); // associate to a session a state
 
     let authorize_url = build_url(
         AUTH_SERVER.authorization_endpoint,
@@ -99,24 +134,33 @@ async fn authorize(State(app): State<AppState>) -> Response {
     Redirect::to(&authorize_url).into_response()
 }
 
+fn error_response(status_code: StatusCode, msg: &str) -> Response {
+    (status_code, render("error", context! {error => msg})).into_response()
+}
+
 async fn callback(
-    State(app): State<AppState>,
+    Extension(session): Extension<SessionRef>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
+    let mut s = session.lock().await;
+    let state = s.state.take(); // Consume
     if let Some(error) = params.get("error") {
         // it's an error response, act accordingly
-        return render("error", context! { error => error });
+        return error_response(StatusCode::BAD_REQUEST, error);
     }
 
-    let mut s = app.lock().await;
+    if !params.contains_key("state") {
+        println!("Missing state in the param");
+        return error_response(StatusCode::BAD_REQUEST, "Missing State Value");
+    }
 
-    if params.get("state") != s.state.as_ref() {
+    if params.get("state") != state.as_ref() {
         println!(
             "State DOES NOT MATCH: expected {:?} got {:?}",
-            s.state,
+            state,
             params.get("state")
         );
-        return render("error", context! { error => "State value did not match" });
+        return error_response(StatusCode::BAD_REQUEST, "State values do not match");
     }
 
     let code = params.get("code").map(String::as_str).unwrap_or("");
@@ -174,11 +218,11 @@ async fn callback(
     s.scope = body["scope"].as_str().map(String::from);
     println!("Got scope: {:?}", s.scope);
 
-    show_tokens(&s)
+    Redirect::to("/").into_response()
 }
 
-async fn fetch_resource(State(app): State<AppState>) -> Response {
-    let mut s = app.lock().await;
+async fn fetch_resource(session: Extension<SessionRef>) -> Response {
+    let mut s = session.lock().await;
 
     let Some(access_token) = s.access_token.clone() else {
         return render("error", context! { error => "Missing Access Token" });
@@ -216,7 +260,7 @@ async fn fetch_resource(State(app): State<AppState>) -> Response {
 
 /// Trades our refresh token for a new access token, then sends the browser
 /// back to /fetch_resource to try again.
-async fn refresh_access_token(s: &mut ClientState) -> Response {
+async fn refresh_access_token(s: &mut Session) -> Response {
     let refresh_token = s.refresh_token.clone().unwrap_or_default();
     println!("Refreshing token {refresh_token}");
 
@@ -268,7 +312,7 @@ async fn refresh_access_token(s: &mut ClientState) -> Response {
 // ---------------------------------------------------------------------------
 
 /// The `Authorization` header value for calling the protected resource.
-fn bearer(s: &ClientState) -> String {
+fn bearer(s: &Session) -> String {
     format!("Bearer {}", s.access_token.as_deref().unwrap_or(""))
 }
 
@@ -285,8 +329,8 @@ async fn words() -> Response {
     words_page("", 0, "")
 }
 
-async fn get_words(State(app): State<AppState>) -> Response {
-    let s = app.lock().await;
+async fn get_words(Extension(session): Extension<SessionRef>) -> Response {
+    let s = session.lock().await;
     let res = reqwest::Client::new()
         .get(WORDS_API)
         .header("Authorization", bearer(&s))
@@ -304,10 +348,10 @@ async fn get_words(State(app): State<AppState>) -> Response {
 }
 
 async fn add_word(
-    State(app): State<AppState>,
+    Extension(session): Extension<SessionRef>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    let s = app.lock().await;
+    let s = session.lock().await;
     let res = reqwest::Client::new()
         .post(WORDS_API)
         .header("Authorization", bearer(&s))
@@ -319,8 +363,8 @@ async fn add_word(
     words_page("", 0, if worked { "add" } else { "noadd" })
 }
 
-async fn delete_word(State(app): State<AppState>) -> Response {
-    let s = app.lock().await;
+async fn delete_word(Extension(session): Extension<SessionRef>) -> Response {
+    let s = session.lock().await;
     let res = reqwest::Client::new()
         .delete(WORDS_API)
         .header("Authorization", bearer(&s))
@@ -335,8 +379,8 @@ async fn delete_word(State(app): State<AppState>) -> Response {
 // Produce API (chapter 4)
 // ---------------------------------------------------------------------------
 
-async fn produce(State(app): State<AppState>) -> Response {
-    let s = app.lock().await;
+async fn produce(Extension(session): Extension<SessionRef>) -> Response {
+    let s = session.lock().await;
     let res = reqwest::Client::new()
         .get(PRODUCE_API)
         .header("Authorization", bearer(&s))
@@ -354,8 +398,8 @@ async fn produce(State(app): State<AppState>) -> Response {
 // Favorites API (chapter 4)
 // ---------------------------------------------------------------------------
 
-async fn favorites(State(app): State<AppState>) -> Response {
-    let s = app.lock().await;
+async fn favorites(Extension(session): Extension<SessionRef>) -> Response {
+    let s = session.lock().await;
     let res = reqwest::Client::new()
         .get(FAVORITES_API)
         .header("Authorization", bearer(&s))
@@ -383,6 +427,7 @@ async fn implicit() -> Response {
 #[tokio::main]
 async fn main() {
     oauth_common::set_views_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/templates"));
+    let sessions = Sessions::default();
 
     let app = Router::new()
         .route("/", get(index))
@@ -396,7 +441,7 @@ async fn main() {
         .route("/produce", get(produce))
         .route("/favorites", get(favorites))
         .route("/implicit", get(implicit))
-        .with_state(AppState::default());
+        .layer(middleware::from_fn_with_state(sessions, with_session));
 
     oauth_common::serve(app, 9000, "OAuth Client").await;
 }
