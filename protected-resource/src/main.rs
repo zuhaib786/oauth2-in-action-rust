@@ -8,7 +8,7 @@
 use std::{
     collections::HashMap,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -296,7 +296,14 @@ async fn main() {
         .route("/produce", get(produce))
         .route("/favorites", get(favorites))
         .route("/helloWorld", get(hello_world))
-        .layer(CorsLayer::permissive()) // `app.use(cors())`
+        .layer(
+            CorsLayer::new()
+                .allow_origin([HeaderValue::from_static("http://localhost:9000")])
+                .allow_methods([Method::GET, Method::POST, Method::DELETE])
+                .allow_headers([AUTHORIZATION, CONTENT_TYPE])
+                .max_age(Duration::from_secs(600))
+                .expose_headers([WWW_AUTHENTICATE]),
+        ) // `app.use(cors()). Allow cors from client only`
         // Browsers must not guess that a JSON answer is really HTML.
         .layer(SetResponseHeaderLayer::overriding(
             X_CONTENT_TYPE_OPTIONS,
