@@ -437,6 +437,20 @@ fn redirect_back(
     Redirect::to(&location).into_response()
 }
 
+/// The parameters as a map, or `None` if any of them appears more than once.
+/// "Request and response parameters MUST NOT be included more than once"
+/// (RFC 6749 §3.1, §3.2): if they were, two pieces of code could each read
+/// a different one.
+fn single_valued(pairs: Vec<(String, String)>) -> Option<HashMap<String, String>> {
+    let mut params = HashMap::with_capacity(pairs.len());
+    for (key, value) in pairs {
+        if params.insert(key, value).is_some() {
+            return None;
+        }
+    }
+    Some(params)
+}
+
 /// The error page, for errors we can't send back to the client.
 fn error_page(error: &str) -> Response {
     let mut page = render("error", context! { error => error });
@@ -469,8 +483,11 @@ async fn index() -> Response {
 /// The authorization endpoint. The client sends the user's browser here.
 async fn authorize(
     State(app): State<AppState>,
-    Query(query): Query<HashMap<String, String>>,
+    Query(pairs): Query<Vec<(String, String)>>,
 ) -> Response {
+    let Some(query) = single_valued(pairs) else {
+        return error_page("A parameter appears more than once");
+    };
     let client_id = param(&query, "client_id");
     let redirect_uri = param(&query, "redirect_uri");
 
@@ -487,9 +504,13 @@ async fn authorize(
         return error_page("Invalid redirect URI");
     }
 
-    // From here on the redirect URI is safe, so errors go back to the client.
+    // The redirect URI is registered, but the user hasn't seen anything yet.
+    // Redirecting an error now would forward them, unasked, to whatever the
+    // client registered: an open redirector (RFC 9700 §4.11.2). So until the
+    // approval page, errors are shown here instead of sent back.
     let Some(response_type) = ResponseType::parse(param(&query, "response_type")) else {
-        return redirect_back(&query, None, &[("error", "unsupported_response_type")]);
+        println!("Unsupported response type from {client_id}");
+        return error_page("Unsupported response type");
     };
 
     if !client.allows_grant(response_type.grant_type()) {
@@ -497,18 +518,15 @@ async fn authorize(
             "Client {client_id} may not use the {} grant",
             response_type.grant_type()
         );
-        return redirect_back(
-            &query,
-            Some(response_type),
-            &[("error", "unauthorized_client")],
-        );
+        return error_page("This client may not use that response type");
     }
 
     let rscope = split_scope(param(&query, "scope"));
     let cscope = split_scope(&client.scope);
     if has_extra_scope(&rscope, &cscope) {
-        // client asked for a scope it couldn't have
-        return redirect_back(&query, Some(response_type), &[("error", "invalid_scope")]);
+        // Client asked for a scope it couldn't have.
+        println!("Client {client_id} asked for scopes it may not have: {rscope:?}");
+        return error_page("Invalid scope");
     }
 
     let reqid = random_string(32);
@@ -549,12 +567,14 @@ async fn approve(
         return error_page(&format!("Unknown user {username}"));
     };
 
+    // Only scopes this request asked for, which /authorize checked the client
+    // may have. Someone posting the form by hand can't add more.
     let scope = scopes_from_form(&form);
-    let client = get_client(param(&query, "client_id")).expect("client was checked in /authorize");
-    if has_extra_scope(&scope, &split_scope(&client.scope)) {
-        // client asked for a scope it couldn't have
-        return redirect_back(&query, response_type, &[("error", "invalid_scope")]);
+    if has_extra_scope(&scope, &split_scope(param(&query, "scope"))) {
+        println!("Approval for scopes that weren't requested: {scope:?}");
+        return error_page("Invalid scope");
     }
+    let client = get_client(param(&query, "client_id")).expect("client was checked in /authorize");
 
     match response_type {
         Some(ResponseType::Code) => {
@@ -597,8 +617,12 @@ async fn approve(
 async fn token(
     State(app): State<AppState>,
     headers: HeaderMap,
-    Form(body): Form<HashMap<String, String>>,
+    Form(pairs): Form<Vec<(String, String)>>,
 ) -> Response {
+    let Some(body) = single_valued(pairs) else {
+        return json_error(StatusCode::BAD_REQUEST, "invalid_request");
+    };
+
     // --- Who is calling? Authenticate the client. ---
     let mut client_id = None;
     let mut client_secret = None;
