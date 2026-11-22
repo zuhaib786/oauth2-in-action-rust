@@ -16,7 +16,10 @@ use axum::{
     extract::{FromRequest, Query, Request, State},
     http::{
         HeaderMap, HeaderValue, Method, StatusCode,
-        header::{AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE, X_CONTENT_TYPE_OPTIONS},
+        header::{
+            AUTHORIZATION, CONTENT_TYPE, STRICT_TRANSPORT_SECURITY, WWW_AUTHENTICATE,
+            X_CONTENT_TYPE_OPTIONS,
+        },
     },
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -319,6 +322,10 @@ async fn main() {
         .layer(SetResponseHeaderLayer::overriding(
             X_CONTENT_TYPE_OPTIONS,
             HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000"),
         ))
         .with_state(state);
 

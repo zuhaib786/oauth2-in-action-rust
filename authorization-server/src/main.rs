@@ -17,7 +17,13 @@ use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::{
     Form, Json, Router,
     extract::{Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{
+        HeaderMap, HeaderValue, StatusCode,
+        header::{
+            CACHE_CONTROL, CONTENT_SECURITY_POLICY, PRAGMA, REFERRER_POLICY,
+            X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
+        },
+    },
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
 };
@@ -28,6 +34,7 @@ use oauth_common::{
 use serde::Serialize;
 use serde_json::json;
 use tokio::sync::Mutex;
+use tower_http::set_header::SetResponseHeaderLayer;
 use url::{Host, Url};
 
 // authorization server information
@@ -794,10 +801,34 @@ async fn main() {
     };
 
     let app = Router::new()
+        .route("/token", post(token))
+        .route_layer(SetResponseHeaderLayer::overriding(
+            CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        ))
+        .route_layer(SetResponseHeaderLayer::overriding(
+            PRAGMA,
+            HeaderValue::from_static("no-cache"),
+        ))
         .route("/", get(index))
         .route("/authorize", get(authorize))
         .route("/approve", post(approve))
-        .route("/token", post(token))
+        .layer(SetResponseHeaderLayer::overriding(
+            X_FRAME_OPTIONS,
+            HeaderValue::from_static("DENY"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("frame-ancestors 'none'"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            REFERRER_POLICY,
+            HeaderValue::from_static("no-referrer"),
+        ))
         .with_state(state);
 
     oauth_common::serve(app, 9001, "OAuth Authorization Server").await;
