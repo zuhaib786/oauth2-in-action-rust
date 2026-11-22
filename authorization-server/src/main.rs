@@ -273,7 +273,14 @@ struct CodeInfo {
     scope: Vec<String>,
     /// Who approved it (their `preferred_username`).
     user: String,
+    /// After this, /token refuses the code (R2).
+    expires_at: Instant,
 }
+
+/// How long a code is good for. RFC 6749 §4.1.2 allows up to 10 minutes; a
+/// client redeems its code within a second or two of getting it, so anything
+/// longer only gives a stolen code more time.
+const CODE_LIFETIME: Duration = Duration::from_secs(60);
 
 /// The JS keeps these in global variables (`var codes = {}` and
 /// `var requests = {}`). Rust makes us put shared, changing data behind a
@@ -445,7 +452,7 @@ async fn authorize(
         return redirect_back(&query, Some(response_type), &[("error", "invalid_scope")]);
     }
 
-    let reqid = random_string(8);
+    let reqid = random_string(32);
     app.inner
         .lock()
         .await
@@ -492,15 +499,19 @@ async fn approve(
 
     match response_type {
         Some(ResponseType::Code) => {
-            let code = random_string(8);
+            let code = random_string(32);
             let response = redirect_back(&query, response_type, &[("code", &code)]);
             // save the code and request for later
+            let now = Instant::now();
+            // Codes nobody redeemed would otherwise pile up forever.
+            state.codes.retain(|_, info| now < info.expires_at);
             state.codes.insert(
                 code,
                 CodeInfo {
                     request: query,
                     scope,
                     user: user.preferred_username.clone(),
+                    expires_at: now + CODE_LIFETIME,
                 },
             );
             response
@@ -508,8 +519,13 @@ async fn approve(
         Some(ResponseType::Token) => {
             // The implicit grant: the token goes straight back to the browser,
             // and never with a refresh token (RFC 6749 §4.2.2).
-            let access_token =
-                issue_access_token(&app.db, client, &scope, Some(&user.preferred_username));
+            let access_token = issue_access_token(
+                &app.db,
+                client,
+                &scope,
+                Some(&user.preferred_username),
+                None,
+            );
             let scope = scope.join(" ");
             redirect_back(
                 &query,
@@ -526,13 +542,20 @@ async fn approve(
 }
 
 /// Creates an access token and saves it for the protected resource.
-fn issue_access_token(db: &Db, client: &Client, scope: &[String], user: Option<&str>) -> String {
+fn issue_access_token(
+    db: &Db,
+    client: &Client,
+    scope: &[String],
+    user: Option<&str>,
+    code: Option<&str>,
+) -> String {
     let access_token = random_string(32);
     db.insert(json!({
         "access_token": access_token,
         "client_id": client.client_id,
         "scope": scope,
         "user": user,
+        "code": code,
     }));
     println!(
         "Issuing access token {access_token} with scope {}",
@@ -618,12 +641,20 @@ async fn authorization_code_grant(
     body: &HashMap<String, String>,
 ) -> Response {
     let code_value = param(body, "code");
+    let removed = app.db.remove(|doc| doc["code"] == code_value);
+    if removed != 0 {
+        return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
+    }
 
     // `remove` both looks the code up and burns it, so it can only be used once
     let Some(code) = app.inner.lock().await.codes.remove(code_value) else {
         println!("Unknown code, {code_value}");
         return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
     };
+    if Instant::now() >= code.expires_at {
+        println!("Expired code, {code_value}");
+        return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
+    }
 
     let code_client_id = param(&code.request, "client_id");
     if code_client_id != client.client_id {
@@ -633,21 +664,45 @@ async fn authorization_code_grant(
         );
         return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
     }
+    let code_redirect_uri = param(&code.request, "redirect_uri");
+    let req_redirect_uri = param(body, "redirect_uri");
+    if code_redirect_uri != req_redirect_uri {
+        return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
+    }
 
-    let access_token = issue_access_token(&app.db, client, &code.scope, Some(&code.user));
-    let refresh_token = issue_refresh_token(&app.db, client, &code.scope, Some(&code.user));
+    let access_token = issue_access_token(
+        &app.db,
+        client,
+        &code.scope,
+        Some(&code.user),
+        Some(code_value),
+    );
+    let refresh_token = issue_refresh_token(
+        &app.db,
+        client,
+        &code.scope,
+        Some(&code.user),
+        Some(code_value),
+    );
     println!("Issued tokens for code {code_value}");
     token_response(&access_token, Some(&refresh_token), &code.scope)
 }
 
 /// Creates a refresh token and saves it for later refresh_token grants.
-fn issue_refresh_token(db: &Db, client: &Client, scope: &[String], user: Option<&str>) -> String {
+fn issue_refresh_token(
+    db: &Db,
+    client: &Client,
+    scope: &[String],
+    user: Option<&str>,
+    code: Option<&str>,
+) -> String {
     let refresh_token = random_string(32);
     db.insert(json!({
         "refresh_token": refresh_token,
         "client_id": client.client_id,
         "scope": scope,
         "user": user,
+        "code": code,
     }));
     println!("Issuing refresh token {refresh_token}");
     refresh_token
@@ -706,7 +761,13 @@ fn refresh_token_grant(
     }
 
     let scope: Vec<String> = serde_json::from_value(token["scope"].clone()).unwrap_or_default();
-    let access_token = issue_access_token(&app.db, client, &scope, token["user"].as_str());
+    let access_token = issue_access_token(
+        &app.db,
+        client,
+        &scope,
+        token["user"].as_str(),
+        token["code"].as_str(),
+    );
     println!("for refresh token {refresh_token}");
     token_response(&access_token, Some(refresh_token), &scope)
 }
@@ -736,7 +797,7 @@ fn client_credentials_grant(
     };
 
     // No refresh token: the client can just ask again (RFC 6749 §4.4.3).
-    let access_token = issue_access_token(&app.db, client, &scope, None);
+    let access_token = issue_access_token(&app.db, client, &scope, None, None);
     token_response(&access_token, None, &scope)
 }
 
@@ -780,10 +841,22 @@ async fn password_grant(
         return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
     };
 
-    let access_token = issue_access_token(&app.db, client, &scope, Some(&user.preferred_username));
-    let refresh_token = client
-        .allows_grant("refresh_token")
-        .then(|| issue_refresh_token(&app.db, client, &scope, Some(&user.preferred_username)));
+    let access_token = issue_access_token(
+        &app.db,
+        client,
+        &scope,
+        Some(&user.preferred_username),
+        None,
+    );
+    let refresh_token = client.allows_grant("refresh_token").then(|| {
+        issue_refresh_token(
+            &app.db,
+            client,
+            &scope,
+            Some(&user.preferred_username),
+            None,
+        )
+    });
     token_response(&access_token, refresh_token.as_deref(), &scope)
 }
 
