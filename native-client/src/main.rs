@@ -19,8 +19,10 @@ use axum::{
     response::Html,
     routing::get,
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use oauth_common::{build_url, random_string};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::{net::TcpListener, sync::oneshot};
 
 const AUTHORIZATION_ENDPOINT: &str = "http://localhost:9001/authorize";
@@ -57,6 +59,8 @@ async fn run() -> Result<String, Error> {
         listener.local_addr()?.port()
     );
     let state = random_string(32);
+    let verifier = random_string(64);
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
 
     let authorize_url = build_url(
         AUTHORIZATION_ENDPOINT,
@@ -66,6 +70,8 @@ async fn run() -> Result<String, Error> {
             ("redirect_uri", &redirect_uri),
             ("scope", SCOPE),
             ("state", &state),
+            ("code_challenge", &challenge),
+            ("code_challenge_method", "S256"),
         ],
     );
     println!("Open this URL in your browser to log in:");
@@ -75,7 +81,7 @@ async fn run() -> Result<String, Error> {
     }
 
     let code = wait_for_code(listener, state).await?;
-    let access_token = trade_code(&code, &redirect_uri).await?;
+    let access_token = trade_code(&code, &redirect_uri, &verifier).await?;
 
     let resource: Value = reqwest::Client::new()
         .post(PROTECTED_RESOURCE)
@@ -179,7 +185,7 @@ fn check_callback(
 
 /// Trades the code for an access token. A public client has no secret, so
 /// it just says who it is.
-async fn trade_code(code: &str, redirect_uri: &str) -> Result<String, Error> {
+async fn trade_code(code: &str, redirect_uri: &str, verifier: &str) -> Result<String, Error> {
     let res = reqwest::Client::new()
         .post(TOKEN_ENDPOINT)
         .form(&[
@@ -187,6 +193,7 @@ async fn trade_code(code: &str, redirect_uri: &str) -> Result<String, Error> {
             ("code", code),
             ("redirect_uri", redirect_uri),
             ("client_id", CLIENT_ID),
+            ("code_verifier", verifier),
         ])
         .send()
         .await?;

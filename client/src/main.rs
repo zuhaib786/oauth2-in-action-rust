@@ -23,8 +23,10 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
     routing::get,
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use oauth_common::{build_url, context, encode_client_credentials, param, random_string, render};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tower_http::set_header::SetResponseHeaderLayer;
 
@@ -70,6 +72,7 @@ struct ClientState {
     access_token: Option<String>,
     scope: Option<String>,
     refresh_token: Option<String>,
+    verifier: Option<String>,
 }
 
 /// One browser's state. Its own lock, so a slow request for one browser
@@ -162,7 +165,9 @@ async fn authorize(Extension(session): Extension<Session>) -> Response {
 
     let state = random_string(32);
     s.state = Some(state.clone());
-
+    let verifier = random_string(64);
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    s.verifier = Some(verifier.clone());
     let authorize_url = build_url(
         AUTH_SERVER.authorization_endpoint,
         &[
@@ -171,6 +176,8 @@ async fn authorize(Extension(session): Extension<Session>) -> Response {
             ("client_id", CLIENT.client_id),
             ("redirect_uri", CLIENT.redirect_uris[0]),
             ("state", &state),
+            ("code_challenge", &challenge),
+            ("code_challenge_method", "S256"),
         ],
     );
 
@@ -203,6 +210,9 @@ async fn callback(
 
     println!("Requesting access token for code {code}");
 
+    if s.verifier.is_none() {
+        return error_page("Invalid request");
+    }
     let tok_res = reqwest::Client::new()
         .post(AUTH_SERVER.token_endpoint)
         .header(
@@ -217,6 +227,7 @@ async fn callback(
             ("grant_type", "authorization_code"),
             ("code", code),
             ("redirect_uri", CLIENT.redirect_uris[0]),
+            ("code_verifier", &s.verifier.take().unwrap()), // Should always be there
         ])
         .send()
         .await;

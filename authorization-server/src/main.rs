@@ -6,6 +6,9 @@
 //!
 //! Run it with:  cargo run -p authorization-server
 
+use sha2::{Digest, Sha256};
+
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use std::{
     collections::HashMap,
     net::{Ipv4Addr, Ipv6Addr},
@@ -252,12 +255,85 @@ async fn password_matches(hash: &'static str, password: String) -> bool {
 /// After this many failed password logins in a row, a username is locked.
 const MAX_FAILED_LOGINS: u32 = 5;
 const LOCKOUT: Duration = Duration::from_secs(60);
+const CODE_CHALLENGE_LENGTH: usize = 43;
 
 /// Recent failed password logins for one username.
 #[derive(Default)]
 struct FailedLogins {
     count: u32,
     locked_until: Option<Instant>,
+}
+
+/// A PKCE code challenge (RFC 7636): the hash of a verifier only the client
+/// knows, and the method that made it. The only way to get one is
+/// `from_request`, so holding a `CodeChallenge` means it passed R1 and R2.
+struct CodeChallenge {
+    challenge: String,
+    method: CodeChallengeMethod,
+}
+
+impl CodeChallenge {
+    /// Reads `code_challenge` and `code_challenge_method` from an authorization
+    /// request. Neither one means the client isn't using PKCE: `Ok(None)`.
+    fn from_request(
+        challenge: Option<&str>,
+        method: Option<&str>,
+    ) -> Result<Option<Self>, &'static str> {
+        let (challenge, method) = match (challenge, method) {
+            (None, None) => return Ok(None),
+            (Some(challenge), Some(method)) => (challenge, method),
+            // RFC 7636 §4.3 reads a missing method as "plain", which we refuse.
+            (Some(_), None) => return Err("Code challenge without a method"),
+            (None, Some(_)) => return Err("Code challenge method without a challenge"),
+        };
+        let method = CodeChallengeMethod::new(method)?;
+
+        // S256 is BASE64URL(SHA256(verifier)) without padding: 32 bytes of
+        // hash always encode to exactly 43 characters of that alphabet.
+        let well_formed = challenge.len() == CODE_CHALLENGE_LENGTH
+            && challenge
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+        if !well_formed {
+            return Err("Code challenge must be 43 base64url characters");
+        }
+
+        Ok(Some(Self {
+            challenge: challenge.to_owned(),
+            method,
+        }))
+    }
+
+    fn verify(&self, verifier: &str) -> bool {
+        match self.method {
+            CodeChallengeMethod::S256 => {
+                // only method for now
+                let well_formed = (43..=128).contains(&verifier.len())
+                    && verifier.bytes().all(|b| {
+                        b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~')
+                    });
+                if !well_formed {
+                    return false;
+                }
+                let hash = Sha256::digest(verifier.as_bytes());
+                let result = URL_SAFE_NO_PAD.encode(hash);
+                result.as_str() == self.challenge.as_str()
+            }
+        }
+        // RFC 7636 §4.1: 43 to 128 characters of [A-Za-z0-9-._~].
+    }
+}
+
+enum CodeChallengeMethod {
+    S256,
+}
+impl CodeChallengeMethod {
+    fn new(method: &str) -> Result<Self, &'static str> {
+        if method != "S256" {
+            return Err("Method not supported");
+        }
+        Ok(CodeChallengeMethod::S256)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -278,6 +354,7 @@ struct CodeInfo {
     /// Set the first time the code is presented. Used codes are kept, so a
     /// second use is recognised as a replay rather than an unknown code.
     used: bool,
+    code_challenge: Option<CodeChallenge>,
 }
 
 /// How long a code may wait to be traded in (RFC 6749 §4.1.2: 10 minutes at most).
@@ -341,6 +418,16 @@ fn revoke_grant(db: &Db, grant_id: &str) {
     println!("Revoked {revoked} tokens of grant {grant_id}");
 }
 
+/// An /authorize request that passed every check, waiting for the user to
+/// click Approve or Deny. It holds what /authorize already parsed, so /approve
+/// doesn't have to parse it again.
+struct PendingRequest {
+    /// The raw query: `redirect_back` still reads `redirect_uri` and `state`
+    /// from it, and the code keeps it for /token.
+    query: HashMap<String, String>,
+    code_challenge: Option<CodeChallenge>,
+}
+
 /// The JS keeps these in global variables (`var codes = {}` and
 /// `var requests = {}`). Rust makes us put shared, changing data behind a
 /// lock, so every handler gets a handle to it through `State`.
@@ -350,7 +437,7 @@ struct ServerState {
     codes: HashMap<String, CodeInfo>,
     /// /authorize requests waiting for the user to click Approve or Deny,
     /// keyed by a random request id that goes into the approval form.
-    requests: HashMap<String, HashMap<String, String>>,
+    requests: HashMap<String, PendingRequest>,
     /// The password grant's brute-force guard, by username.
     failed_logins: HashMap<String, FailedLogins>,
 }
@@ -488,6 +575,16 @@ async fn authorize(
     let Some(query) = single_valued(pairs) else {
         return error_page("A parameter appears more than once");
     };
+    let code_challenge = match CodeChallenge::from_request(
+        query.get("code_challenge").map(String::as_str),
+        query.get("code_challenge_method").map(String::as_str),
+    ) {
+        Ok(code_challenge) => code_challenge,
+        Err(reason) => {
+            println!("Bad PKCE parameters: {reason}");
+            return error_page(reason);
+        }
+    };
     let client_id = param(&query, "client_id");
     let redirect_uri = param(&query, "redirect_uri");
 
@@ -513,6 +610,12 @@ async fn authorize(
         return error_page("Unsupported response type");
     };
 
+    if client.client_secret.is_none()
+        && code_challenge.is_none()
+        && response_type == ResponseType::Code
+    {
+        return error_page("invalid_request"); // PKCE is required for public clients
+    }
     if !client.allows_grant(response_type.grant_type()) {
         println!(
             "Client {client_id} may not use the {} grant",
@@ -530,11 +633,15 @@ async fn authorize(
     }
 
     let reqid = random_string(32);
+    let pending = PendingRequest {
+        query: query.clone(),
+        code_challenge,
+    };
     app.inner
         .lock()
         .await
         .requests
-        .insert(reqid.clone(), query.clone());
+        .insert(reqid.clone(), pending);
 
     render(
         "approve",
@@ -549,10 +656,14 @@ async fn approve(
 ) -> Response {
     let mut state = app.inner.lock().await;
 
-    let Some(query) = state.requests.remove(param(&form, "reqid")) else {
+    let Some(pending) = state.requests.remove(param(&form, "reqid")) else {
         // there was no matching saved request, this is an error
         return error_page("No matching authorization request");
     };
+    let PendingRequest {
+        query,
+        code_challenge,
+    } = pending;
     let response_type = ResponseType::parse(param(&query, "response_type"));
 
     if !form.contains_key("approve") {
@@ -588,6 +699,7 @@ async fn approve(
                 grant_id: random_string(32),
                 issued_at: Instant::now(),
                 used: false,
+                code_challenge,
             };
             state.codes.insert(code, info);
             response
@@ -713,7 +825,18 @@ async fn authorization_code_grant(
             println!("Code {code_value} has expired");
             return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
         }
-
+        let code_verifier = body.get("code_verifier");
+        let verified = match (code.code_challenge.as_ref(), code_verifier) {
+            (Some(code_challenge), Some(verifier)) => code_challenge.verify(verifier),
+            (None, None) => true,
+            _ => false,
+        };
+        if !verified {
+            return json_error(StatusCode::BAD_REQUEST, "invalid_grant");
+        }
+        if code.code_challenge.is_some() && code_verifier.is_none() {
+            return error_page("invalid_grant");
+        }
         let code_client_id = param(&code.request, "client_id");
         if code_client_id != client.client_id {
             println!(

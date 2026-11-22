@@ -12,3 +12,5 @@ serde.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true
 tower-http = { workspace = true, features = ["set-header"] }
+base64.workspace = true
+sha2.workspace = true
